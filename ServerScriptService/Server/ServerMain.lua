@@ -68,20 +68,56 @@ local GameLoop = require(CorePath:WaitForChild("GameLoop"))
 print("[ServerMain] Core Modules geladen!")
 
 -------------------------------------------------
--- CORE INITIALISIEREN
+-- SERVICES LADEN
 -------------------------------------------------
-print("[ServerMain] Initialisiere Core...")
+print("[ServerMain] Lade Services...")
 
--- DataManager zuerst (hat keine Abhängigkeiten)
+local CurrencyService = require(ServicesPath:WaitForChild("CurrencyService"))
+local ShopService = require(ServicesPath:WaitForChild("ShopService"))
+
+print("[ServerMain] Services geladen!")
+
+-------------------------------------------------
+-- SYSTEMS LADEN
+-------------------------------------------------
+print("[ServerMain] Lade Systems...")
+
+local DungeonSystem = require(SystemsPath:WaitForChild("DungeonSystem"))
+local RaidSystem = require(SystemsPath:WaitForChild("RaidSystem"))
+local HeroSystem = require(SystemsPath:WaitForChild("HeroSystem"))
+
+print("[ServerMain] Systems geladen!")
+
+-------------------------------------------------
+-- INITIALISIERUNG (Reihenfolge wichtig!)
+-------------------------------------------------
+print("[ServerMain] Initialisiere Module...")
+
+-- 1. DataManager zuerst (keine Abhängigkeiten)
 DataManager.Initialize()
 
--- PlayerManager (braucht DataManager)
+-- 2. PlayerManager (braucht DataManager)
 PlayerManager.Initialize(DataManager)
 
--- GameLoop (braucht DataManager und PlayerManager)
+-- 3. CurrencyService (braucht DataManager, PlayerManager)
+CurrencyService.Initialize(DataManager, PlayerManager)
+
+-- 4. ShopService (braucht DataManager, PlayerManager, CurrencyService)
+ShopService.Initialize(DataManager, PlayerManager, CurrencyService)
+
+-- 5. DungeonSystem (braucht DataManager, PlayerManager, CurrencyService)
+DungeonSystem.Initialize(DataManager, PlayerManager, CurrencyService)
+
+-- 6. HeroSystem (braucht DataManager, PlayerManager, CurrencyService)
+HeroSystem.Initialize(DataManager, PlayerManager, CurrencyService)
+
+-- 7. RaidSystem (braucht DataManager, PlayerManager, CurrencyService, DungeonSystem)
+RaidSystem.Initialize(DataManager, PlayerManager, CurrencyService, DungeonSystem)
+
+-- 8. GameLoop (braucht DataManager, PlayerManager)
 GameLoop.Initialize(DataManager, PlayerManager)
 
-print("[ServerMain] Core initialisiert!")
+print("[ServerMain] Module initialisiert!")
 
 -------------------------------------------------
 -- REMOTE HANDLER VERBINDEN
@@ -132,27 +168,21 @@ RemoteIndex.Get("Currency_CollectPassive").OnServerInvoke = function(player)
         return { Success = false, Error = "Nichts zum Abholen" }
     end
     
-    -- Gold hinzufügen
-    local currentGold = data.Currency.Gold or 0
-    local addable = CurrencyUtil.CalculateAddable(currentGold, accumulated, "Gold")
+    -- Gold hinzufügen über CurrencyService
+    local success, actualAmount = CurrencyService.AddGold(
+        player,
+        accumulated,
+        CurrencyService.TransactionType.PassiveIncome,
+        "PassiveCollect"
+    )
     
-    if addable > 0 then
-        DataManager.IncrementValue(player, "Currency.Gold", addable)
-        DataManager.IncrementValue(player, "Stats.TotalGoldEarned", addable)
+    if success then
         DataManager.SetValue(player, "Cooldowns.LastPassiveCollect", currentTime)
-        
-        -- Client updaten
-        RemoteIndex.FireClient("Currency_Update", player, {
-            Gold = currentGold + addable,
-            Gems = data.Currency.Gems,
-            Source = "PassiveCollect",
-            Amount = addable,
-        })
         
         return {
             Success = true,
-            Amount = addable,
-            NewTotal = currentGold + addable,
+            Amount = actualAmount,
+            NewTotal = DataManager.GetValue(player, "Currency.Gold"),
         }
     end
     
@@ -167,372 +197,86 @@ end
 
 -- Dungeon_AddRoom: Neuen Raum kaufen
 RemoteIndex.Get("Dungeon_AddRoom").OnServerInvoke = function(player, roomId)
-    local data = DataManager.GetData(player)
-    if not data then
-        return { Success = false, Error = "Daten nicht geladen" }
+    local success, errorMsg, roomIndex = DungeonSystem.AddRoom(player, roomId)
+    
+    if success then
+        return {
+            Success = true,
+            RoomIndex = roomIndex,
+        }
+    else
+        return { Success = false, Error = errorMsg }
     end
-    
-    -- Raum-Config prüfen
-    local roomConfig = RoomConfig.GetRoom(roomId)
-    if not roomConfig then
-        return { Success = false, Error = "Ungültiger Raum-Typ" }
-    end
-    
-    -- Maximale Räume prüfen
-    local currentRooms = #data.Dungeon.Rooms
-    if currentRooms >= GameConfig.Dungeon.MaxRooms then
-        return { Success = false, Error = "Maximale Raumanzahl erreicht" }
-    end
-    
-    -- Unlock-Requirement prüfen
-    local req = roomConfig.UnlockRequirement
-    if req.Type == "DungeonLevel" then
-        if data.Dungeon.Level < req.Level then
-            return { Success = false, Error = "Dungeon-Level " .. req.Level .. " benötigt" }
-        end
-    end
-    
-    -- MaxPerDungeon prüfen
-    if roomConfig.MaxPerDungeon then
-        local count = 0
-        for _, room in ipairs(data.Dungeon.Rooms) do
-            if room.RoomId == roomId then
-                count = count + 1
-            end
-        end
-        if count >= roomConfig.MaxPerDungeon then
-            return { Success = false, Error = "Maximum dieses Raum-Typs erreicht" }
-        end
-    end
-    
-    -- Kosten berechnen (Raum-Kosten + Position-Kosten)
-    local roomCost = {
-        Gold = roomConfig.PurchaseCost,
-        Gems = roomConfig.PurchaseGems,
-    }
-    local positionCost = CurrencyUtil.CalculateNewRoomCost(currentRooms)
-    local totalCost = CurrencyUtil.AddCosts(roomCost, positionCost)
-    
-    -- Prestige-Rabatt anwenden
-    totalCost = CurrencyUtil.ApplyPrestigeDiscount(totalCost, data.Prestige.Level or 0)
-    
-    -- Kosten prüfen
-    local canAfford, affordError = CurrencyUtil.CanAfford(data.Currency, totalCost)
-    if not canAfford then
-        return { Success = false, Error = affordError }
-    end
-    
-    -- Kosten abziehen
-    DataManager.IncrementValue(player, "Currency.Gold", -totalCost.Gold)
-    DataManager.IncrementValue(player, "Currency.Gems", -totalCost.Gems)
-    DataManager.IncrementValue(player, "Stats.TotalGoldSpent", totalCost.Gold)
-    DataManager.IncrementValue(player, "Stats.TotalGemsSpent", totalCost.Gems)
-    
-    -- Neuen Raum hinzufügen
-    local newRoom = {
-        RoomId = roomId,
-        Level = 1,
-        Traps = {},
-        Monsters = {},
-    }
-    
-    local rooms = data.Dungeon.Rooms
-    rooms[#rooms + 1] = newRoom
-    DataManager.SetValue(player, "Dungeon.Rooms", rooms)
-    
-    -- XP für Dungeon hinzufügen
-    local xpGain = 50 + (currentRooms * 10)
-    DataManager.IncrementValue(player, "Dungeon.Experience", xpGain)
-    
-    -- Level-Up prüfen
-    local newExp = data.Dungeon.Experience + xpGain
-    local newLevel = DataTemplate.CalculateDungeonLevel(newExp)
-    if newLevel > data.Dungeon.Level then
-        DataManager.SetValue(player, "Dungeon.Level", newLevel)
-        PlayerManager.SendNotification(player, "Level Up!", "Dein Dungeon ist jetzt Level " .. newLevel, "Success")
-    end
-    
-    -- Client updaten
-    RemoteIndex.FireClient("Currency_Update", player, {
-        Gold = data.Currency.Gold - totalCost.Gold,
-        Gems = data.Currency.Gems - totalCost.Gems,
-    })
-    
-    RemoteIndex.FireClient("Dungeon_Update", player, {
-        Level = newLevel or data.Dungeon.Level,
-        Experience = newExp,
-        Rooms = rooms,
-    })
-    
-    return {
-        Success = true,
-        RoomIndex = #rooms,
-        Cost = totalCost,
-    }
 end
 
--- Dungeon_PlaceTrap: Falle in Raum platzieren
+-- Dungeon_UpgradeRoom: Raum upgraden
+RemoteIndex.Get("Dungeon_UpgradeRoom").OnServerInvoke = function(player, roomIndex)
+    local success, errorMsg, newLevel, cost = ShopService.UpgradeRoom(player, roomIndex)
+    
+    if success then
+        return {
+            Success = true,
+            NewLevel = newLevel,
+            Cost = cost,
+        }
+    else
+        return { Success = false, Error = errorMsg }
+    end
+end
+
+-- Dungeon_PlaceTrap: Falle platzieren
 RemoteIndex.Get("Dungeon_PlaceTrap").OnServerInvoke = function(player, roomIndex, slotIndex, trapId)
-    local data = DataManager.GetData(player)
-    if not data then
-        return { Success = false, Error = "Daten nicht geladen" }
+    local success, errorMsg = DungeonSystem.PlaceTrap(player, roomIndex, slotIndex, trapId)
+    
+    if success then
+        return { Success = true }
+    else
+        return { Success = false, Error = errorMsg }
     end
-    
-    -- Raum prüfen
-    local room = data.Dungeon.Rooms[roomIndex]
-    if not room then
-        return { Success = false, Error = "Ungültiger Raum" }
-    end
-    
-    -- Trap-Config prüfen
-    local trapConfig = TrapConfig.GetTrap(trapId)
-    if not trapConfig then
-        return { Success = false, Error = "Ungültige Falle" }
-    end
-    
-    -- Freischaltung prüfen
-    if not data.Dungeon.UnlockedTraps[trapId] then
-        return { Success = false, Error = "Falle nicht freigeschaltet" }
-    end
-    
-    -- Slot-Limit prüfen
-    local roomConfig = RoomConfig.GetRoom(room.RoomId)
-    if slotIndex < 1 or slotIndex > roomConfig.TrapSlots then
-        return { Success = false, Error = "Ungültiger Fallen-Slot" }
-    end
-    
-    -- Kosten prüfen (erste Platzierung kostenlos, danach Kosten)
-    local existingTrap = room.Traps[slotIndex]
-    local cost = { Gold = 0, Gems = 0 }
-    
-    if not existingTrap then
-        -- Erste Platzierung: volle Kosten
-        cost = {
-            Gold = trapConfig.PurchaseCost,
-            Gems = trapConfig.PurchaseGems,
-        }
-    end
-    
-    -- Prestige-Rabatt
-    cost = CurrencyUtil.ApplyPrestigeDiscount(cost, data.Prestige.Level or 0)
-    
-    -- Kosten prüfen
-    if cost.Gold > 0 or cost.Gems > 0 then
-        local canAfford, affordError = CurrencyUtil.CanAfford(data.Currency, cost)
-        if not canAfford then
-            return { Success = false, Error = affordError }
-        end
-        
-        -- Kosten abziehen
-        DataManager.IncrementValue(player, "Currency.Gold", -cost.Gold)
-        DataManager.IncrementValue(player, "Currency.Gems", -cost.Gems)
-        DataManager.IncrementValue(player, "Stats.TotalGoldSpent", cost.Gold)
-        DataManager.IncrementValue(player, "Stats.TotalGemsSpent", cost.Gems)
-    end
-    
-    -- Falle platzieren
-    room.Traps[slotIndex] = {
-        TrapId = trapId,
-        Level = 1,
-    }
-    DataManager.SetValue(player, "Dungeon.Rooms", data.Dungeon.Rooms)
-    
-    -- Client updaten
-    if cost.Gold > 0 or cost.Gems > 0 then
-        RemoteIndex.FireClient("Currency_Update", player, {
-            Gold = data.Currency.Gold,
-            Gems = data.Currency.Gems,
-        })
-    end
-    
-    RemoteIndex.FireClient("Dungeon_Update", player, {
-        Rooms = data.Dungeon.Rooms,
-    })
-    
-    return {
-        Success = true,
-        Cost = cost,
-    }
-end
-
--- Dungeon_PlaceMonster: Monster in Raum platzieren
-RemoteIndex.Get("Dungeon_PlaceMonster").OnServerInvoke = function(player, roomIndex, slotIndex, monsterId)
-    local data = DataManager.GetData(player)
-    if not data then
-        return { Success = false, Error = "Daten nicht geladen" }
-    end
-    
-    -- Raum prüfen
-    local room = data.Dungeon.Rooms[roomIndex]
-    if not room then
-        return { Success = false, Error = "Ungültiger Raum" }
-    end
-    
-    -- Monster-Config prüfen
-    local monsterConfig = MonsterConfig.GetMonster(monsterId)
-    if not monsterConfig then
-        return { Success = false, Error = "Ungültiges Monster" }
-    end
-    
-    -- Freischaltung prüfen
-    if not data.Dungeon.UnlockedMonsters[monsterId] then
-        return { Success = false, Error = "Monster nicht freigeschaltet" }
-    end
-    
-    -- Raum-Einschränkungen prüfen
-    local roomConfig = RoomConfig.GetRoom(room.RoomId)
-    if not RoomConfig.CanPlaceMonster(room.RoomId, monsterConfig.Rarity) then
-        return { Success = false, Error = "Dieses Monster kann hier nicht platziert werden" }
-    end
-    
-    -- Slot-Limit prüfen
-    if slotIndex < 1 or slotIndex > roomConfig.MonsterSlots then
-        return { Success = false, Error = "Ungültiger Monster-Slot" }
-    end
-    
-    -- MaxPerDungeon für Monster prüfen
-    if monsterConfig.MaxPerDungeon then
-        local count = 0
-        for _, r in ipairs(data.Dungeon.Rooms) do
-            for _, m in pairs(r.Monsters or {}) do
-                if m.MonsterId == monsterId then
-                    count = count + 1
-                end
-            end
-        end
-        if count >= monsterConfig.MaxPerDungeon then
-            return { Success = false, Error = "Maximum dieses Monster-Typs erreicht" }
-        end
-    end
-    
-    -- Kosten
-    local existingMonster = room.Monsters[slotIndex]
-    local cost = { Gold = 0, Gems = 0 }
-    
-    if not existingMonster then
-        cost = {
-            Gold = monsterConfig.PurchaseCost,
-            Gems = monsterConfig.PurchaseGems,
-        }
-    end
-    
-    cost = CurrencyUtil.ApplyPrestigeDiscount(cost, data.Prestige.Level or 0)
-    
-    if cost.Gold > 0 or cost.Gems > 0 then
-        local canAfford, affordError = CurrencyUtil.CanAfford(data.Currency, cost)
-        if not canAfford then
-            return { Success = false, Error = affordError }
-        end
-        
-        DataManager.IncrementValue(player, "Currency.Gold", -cost.Gold)
-        DataManager.IncrementValue(player, "Currency.Gems", -cost.Gems)
-        DataManager.IncrementValue(player, "Stats.TotalGoldSpent", cost.Gold)
-        DataManager.IncrementValue(player, "Stats.TotalGemsSpent", cost.Gems)
-    end
-    
-    -- Monster platzieren
-    room.Monsters[slotIndex] = {
-        MonsterId = monsterId,
-        Level = 1,
-    }
-    DataManager.SetValue(player, "Dungeon.Rooms", data.Dungeon.Rooms)
-    
-    -- Client updaten
-    if cost.Gold > 0 or cost.Gems > 0 then
-        RemoteIndex.FireClient("Currency_Update", player, {
-            Gold = data.Currency.Gold,
-            Gems = data.Currency.Gems,
-        })
-    end
-    
-    RemoteIndex.FireClient("Dungeon_Update", player, {
-        Rooms = data.Dungeon.Rooms,
-    })
-    
-    return {
-        Success = true,
-        Cost = cost,
-    }
 end
 
 -- Dungeon_RemoveTrap: Falle entfernen
 RemoteIndex.Get("Dungeon_RemoveTrap").OnServerInvoke = function(player, roomIndex, slotIndex)
-    local data = DataManager.GetData(player)
-    if not data then
-        return { Success = false, Error = "Daten nicht geladen" }
+    local success, errorMsg = DungeonSystem.RemoveTrap(player, roomIndex, slotIndex)
+    
+    if success then
+        return { Success = true }
+    else
+        return { Success = false, Error = errorMsg }
     end
+end
+
+-- Dungeon_PlaceMonster: Monster platzieren
+RemoteIndex.Get("Dungeon_PlaceMonster").OnServerInvoke = function(player, roomIndex, slotIndex, monsterId)
+    local success, errorMsg = DungeonSystem.PlaceMonster(player, roomIndex, slotIndex, monsterId)
     
-    local room = data.Dungeon.Rooms[roomIndex]
-    if not room then
-        return { Success = false, Error = "Ungültiger Raum" }
+    if success then
+        return { Success = true }
+    else
+        return { Success = false, Error = errorMsg }
     end
-    
-    if not room.Traps[slotIndex] then
-        return { Success = false, Error = "Keine Falle in diesem Slot" }
-    end
-    
-    room.Traps[slotIndex] = nil
-    DataManager.SetValue(player, "Dungeon.Rooms", data.Dungeon.Rooms)
-    
-    RemoteIndex.FireClient("Dungeon_Update", player, {
-        Rooms = data.Dungeon.Rooms,
-    })
-    
-    return { Success = true }
 end
 
 -- Dungeon_RemoveMonster: Monster entfernen
 RemoteIndex.Get("Dungeon_RemoveMonster").OnServerInvoke = function(player, roomIndex, slotIndex)
-    local data = DataManager.GetData(player)
-    if not data then
-        return { Success = false, Error = "Daten nicht geladen" }
+    local success, errorMsg = DungeonSystem.RemoveMonster(player, roomIndex, slotIndex)
+    
+    if success then
+        return { Success = true }
+    else
+        return { Success = false, Error = errorMsg }
     end
-    
-    local room = data.Dungeon.Rooms[roomIndex]
-    if not room then
-        return { Success = false, Error = "Ungültiger Raum" }
-    end
-    
-    if not room.Monsters[slotIndex] then
-        return { Success = false, Error = "Kein Monster in diesem Slot" }
-    end
-    
-    room.Monsters[slotIndex] = nil
-    DataManager.SetValue(player, "Dungeon.Rooms", data.Dungeon.Rooms)
-    
-    RemoteIndex.FireClient("Dungeon_Update", player, {
-        Rooms = data.Dungeon.Rooms,
-    })
-    
-    return { Success = true }
 end
 
 -- Dungeon_Rename: Dungeon umbenennen
 RemoteIndex.Get("Dungeon_Rename").OnServerInvoke = function(player, newName)
-    local data = DataManager.GetData(player)
-    if not data then
-        return { Success = false, Error = "Daten nicht geladen" }
+    local success, errorMsg, sanitizedName = DungeonSystem.RenameDungeon(player, newName)
+    
+    if success then
+        return { Success = true, Name = sanitizedName }
+    else
+        return { Success = false, Error = errorMsg }
     end
-    
-    -- Name validieren
-    if type(newName) ~= "string" then
-        return { Success = false, Error = "Ungültiger Name" }
-    end
-    
-    newName = string.sub(newName, 1, 30)  -- Max 30 Zeichen
-    newName = string.gsub(newName, "[^%w%s%-_]", "")  -- Nur alphanumerisch, Leerzeichen, Bindestrich, Unterstrich
-    
-    if #newName < 3 then
-        return { Success = false, Error = "Name zu kurz (min. 3 Zeichen)" }
-    end
-    
-    DataManager.SetValue(player, "Dungeon.Name", newName)
-    
-    RemoteIndex.FireClient("Dungeon_Update", player, {
-        Name = newName,
-    })
-    
-    return { Success = true, Name = newName }
 end
 
 --[[
@@ -543,112 +287,46 @@ end
 
 -- Shop_UnlockTrap: Falle freischalten
 RemoteIndex.Get("Shop_UnlockTrap").OnServerInvoke = function(player, trapId)
-    local data = DataManager.GetData(player)
-    if not data then
-        return { Success = false, Error = "Daten nicht geladen" }
+    local success, errorMsg, cost = ShopService.UnlockTrap(player, trapId)
+    
+    if success then
+        return { Success = true, Cost = cost }
+    else
+        return { Success = false, Error = errorMsg }
     end
-    
-    -- Bereits freigeschaltet?
-    if data.Dungeon.UnlockedTraps[trapId] then
-        return { Success = false, Error = "Bereits freigeschaltet" }
-    end
-    
-    -- Trap-Config prüfen
-    local trapConfig = TrapConfig.GetTrap(trapId)
-    if not trapConfig then
-        return { Success = false, Error = "Ungültige Falle" }
-    end
-    
-    -- Kosten (doppelter Kaufpreis zum Freischalten)
-    local cost = {
-        Gold = trapConfig.PurchaseCost * 2,
-        Gems = trapConfig.PurchaseGems * 2,
-    }
-    
-    cost = CurrencyUtil.ApplyPrestigeDiscount(cost, data.Prestige.Level or 0)
-    
-    local canAfford, affordError = CurrencyUtil.CanAfford(data.Currency, cost)
-    if not canAfford then
-        return { Success = false, Error = affordError }
-    end
-    
-    -- Kosten abziehen
-    DataManager.IncrementValue(player, "Currency.Gold", -cost.Gold)
-    DataManager.IncrementValue(player, "Currency.Gems", -cost.Gems)
-    DataManager.IncrementValue(player, "Stats.TotalGoldSpent", cost.Gold)
-    DataManager.IncrementValue(player, "Stats.TotalGemsSpent", cost.Gems)
-    
-    -- Freischalten
-    data.Dungeon.UnlockedTraps[trapId] = true
-    DataManager.SetValue(player, "Dungeon.UnlockedTraps", data.Dungeon.UnlockedTraps)
-    
-    -- Client updaten
-    RemoteIndex.FireClient("Currency_Update", player, {
-        Gold = data.Currency.Gold,
-        Gems = data.Currency.Gems,
-    })
-    
-    RemoteIndex.FireClient("Dungeon_Update", player, {
-        UnlockedTraps = data.Dungeon.UnlockedTraps,
-    })
-    
-    PlayerManager.SendNotification(player, "Freigeschaltet!", trapConfig.Name .. " ist jetzt verfügbar.", "Success")
-    
-    return { Success = true, Cost = cost }
 end
 
 -- Shop_UnlockMonster: Monster freischalten
 RemoteIndex.Get("Shop_UnlockMonster").OnServerInvoke = function(player, monsterId)
-    local data = DataManager.GetData(player)
-    if not data then
-        return { Success = false, Error = "Daten nicht geladen" }
+    local success, errorMsg, cost = ShopService.UnlockMonster(player, monsterId)
+    
+    if success then
+        return { Success = true, Cost = cost }
+    else
+        return { Success = false, Error = errorMsg }
     end
+end
+
+-- Shop_UnlockRoom: Raum-Typ freischalten
+RemoteIndex.Get("Shop_UnlockRoom").OnServerInvoke = function(player, roomId)
+    local success, errorMsg, cost = ShopService.UnlockRoom(player, roomId)
     
-    if data.Dungeon.UnlockedMonsters[monsterId] then
-        return { Success = false, Error = "Bereits freigeschaltet" }
+    if success then
+        return { Success = true, Cost = cost }
+    else
+        return { Success = false, Error = errorMsg }
     end
+end
+
+-- Shop_UnlockHero: Held freischalten
+RemoteIndex.Get("Shop_UnlockHero").OnServerInvoke = function(player, heroId)
+    local success, errorMsg, cost = ShopService.UnlockHero(player, heroId)
     
-    local monsterConfig = MonsterConfig.GetMonster(monsterId)
-    if not monsterConfig then
-        return { Success = false, Error = "Ungültiges Monster" }
+    if success then
+        return { Success = true, Cost = cost }
+    else
+        return { Success = false, Error = errorMsg }
     end
-    
-    if monsterConfig.Purchasable == false then
-        return { Success = false, Error = "Dieses Monster kann nicht gekauft werden" }
-    end
-    
-    local cost = {
-        Gold = monsterConfig.PurchaseCost * 2,
-        Gems = monsterConfig.PurchaseGems * 2,
-    }
-    
-    cost = CurrencyUtil.ApplyPrestigeDiscount(cost, data.Prestige.Level or 0)
-    
-    local canAfford, affordError = CurrencyUtil.CanAfford(data.Currency, cost)
-    if not canAfford then
-        return { Success = false, Error = affordError }
-    end
-    
-    DataManager.IncrementValue(player, "Currency.Gold", -cost.Gold)
-    DataManager.IncrementValue(player, "Currency.Gems", -cost.Gems)
-    DataManager.IncrementValue(player, "Stats.TotalGoldSpent", cost.Gold)
-    DataManager.IncrementValue(player, "Stats.TotalGemsSpent", cost.Gems)
-    
-    data.Dungeon.UnlockedMonsters[monsterId] = true
-    DataManager.SetValue(player, "Dungeon.UnlockedMonsters", data.Dungeon.UnlockedMonsters)
-    
-    RemoteIndex.FireClient("Currency_Update", player, {
-        Gold = data.Currency.Gold,
-        Gems = data.Currency.Gems,
-    })
-    
-    RemoteIndex.FireClient("Dungeon_Update", player, {
-        UnlockedMonsters = data.Dungeon.UnlockedMonsters,
-    })
-    
-    PlayerManager.SendNotification(player, "Freigeschaltet!", monsterConfig.Name .. " ist jetzt verfügbar.", "Success")
-    
-    return { Success = true, Cost = cost }
 end
 
 --[[
@@ -659,118 +337,247 @@ end
 
 -- Heroes_Recruit: Held rekrutieren
 RemoteIndex.Get("Heroes_Recruit").OnServerInvoke = function(player, heroId)
-    local data = DataManager.GetData(player)
-    if not data then
-        return { Success = false, Error = "Daten nicht geladen" }
+    local success, result = HeroSystem.RecruitHero(player, heroId)
+    
+    if success then
+        return {
+            Success = true,
+            HeroInstanceId = result.InstanceId,
+            Hero = result.Hero,
+            Rarity = result.Rarity,
+            RarityName = result.RarityName,
+        }
+    else
+        return { Success = false, Error = result }
     end
-    
-    -- Hero-Config prüfen
-    local heroConfig = HeroConfig.GetHero(heroId)
-    if not heroConfig then
-        return { Success = false, Error = "Ungültiger Held" }
-    end
-    
-    -- Freischaltung prüfen
-    if not data.Heroes.Unlocked[heroId] then
-        return { Success = false, Error = "Held nicht freigeschaltet" }
-    end
-    
-    -- Kosten
-    local cost = {
-        Gold = heroConfig.RecruitCost,
-        Gems = heroConfig.RecruitGems,
-    }
-    
-    cost = CurrencyUtil.ApplyPrestigeDiscount(cost, data.Prestige.Level or 0)
-    
-    local canAfford, affordError = CurrencyUtil.CanAfford(data.Currency, cost)
-    if not canAfford then
-        return { Success = false, Error = affordError }
-    end
-    
-    -- Kosten abziehen
-    DataManager.IncrementValue(player, "Currency.Gold", -cost.Gold)
-    DataManager.IncrementValue(player, "Currency.Gems", -cost.Gems)
-    DataManager.IncrementValue(player, "Stats.TotalGoldSpent", cost.Gold)
-    DataManager.IncrementValue(player, "Stats.TotalGemsSpent", cost.Gems)
-    
-    -- Rarität würfeln
-    local roll = math.random()
-    local rarity = "Common"
-    local cumulativeChance = 0
-    
-    for rarityName, rarityData in pairs(HeroConfig.Rarities) do
-        cumulativeChance = cumulativeChance + rarityData.DropChance
-        if roll <= cumulativeChance then
-            rarity = rarityName
-            break
-        end
-    end
-    
-    -- Neuen Helden erstellen
-    local heroInstanceId = DataTemplate.GenerateUniqueId()
-    local newHero = {
-        HeroId = heroId,
-        Level = 1,
-        Experience = 0,
-        Rarity = rarity,
-    }
-    
-    data.Heroes.Owned[heroInstanceId] = newHero
-    DataManager.SetValue(player, "Heroes.Owned", data.Heroes.Owned)
-    
-    -- Client updaten
-    RemoteIndex.FireClient("Currency_Update", player, {
-        Gold = data.Currency.Gold,
-        Gems = data.Currency.Gems,
-    })
-    
-    RemoteIndex.FireClient("Heroes_Update", player, {
-        Owned = data.Heroes.Owned,
-    })
-    
-    local rarityColor = HeroConfig.Rarities[rarity].Name
-    PlayerManager.SendNotification(player, "Held rekrutiert!", heroConfig.Name .. " (" .. rarityColor .. ")", "Success")
-    
-    return {
-        Success = true,
-        HeroInstanceId = heroInstanceId,
-        Hero = newHero,
-        Rarity = rarity,
-    }
 end
 
 -- Heroes_SetTeam: Raid-Team setzen
 RemoteIndex.Get("Heroes_SetTeam").OnServerInvoke = function(player, teamIds)
+    local success, errorMsg, synergies = HeroSystem.SetTeam(player, teamIds)
+    
+    if success then
+        return {
+            Success = true,
+            Synergies = synergies,
+        }
+    else
+        return { Success = false, Error = errorMsg }
+    end
+end
+
+-- Heroes_Upgrade: Held upgraden (XP hinzufügen)
+RemoteIndex.Get("Heroes_Upgrade").OnServerInvoke = function(player, heroInstanceId, xpAmount)
+    -- XP durch Items/Käufe - hier Beispiel mit fixen Kosten
     local data = DataManager.GetData(player)
     if not data then
         return { Success = false, Error = "Daten nicht geladen" }
     end
     
-    -- Team validieren
-    if type(teamIds) ~= "table" then
-        return { Success = false, Error = "Ungültiges Team-Format" }
+    -- Kosten: 100 Gold pro 10 XP
+    local cost = { Gold = math.floor(xpAmount * 10), Gems = 0 }
+    
+    local purchaseSuccess, purchaseError = CurrencyService.Purchase(
+        player,
+        cost,
+        CurrencyService.TransactionType.Upgrade,
+        "HeroXP:" .. heroInstanceId
+    )
+    
+    if not purchaseSuccess then
+        return { Success = false, Error = purchaseError }
     end
     
-    if #teamIds > GameConfig.Heroes.MaxPartySize then
-        return { Success = false, Error = "Zu viele Helden im Team (max " .. GameConfig.Heroes.MaxPartySize .. ")" }
+    local success, newLevel, leveledUp = HeroSystem.AddHeroXP(player, heroInstanceId, xpAmount)
+    
+    if success then
+        return {
+            Success = true,
+            NewLevel = newLevel,
+            LeveledUp = leveledUp,
+        }
+    else
+        return { Success = false, Error = "Held nicht gefunden" }
+    end
+end
+
+-- Heroes_Dismiss: Held entlassen
+RemoteIndex.Get("Heroes_Dismiss").OnServerInvoke = function(player, heroInstanceId)
+    local success, errorMsg, refund = HeroSystem.DismissHero(player, heroInstanceId)
+    
+    if success then
+        return {
+            Success = true,
+            Refund = refund,
+        }
+    else
+        return { Success = false, Error = errorMsg }
+    end
+end
+
+--[[
+    =============================================
+    RAIDS
+    =============================================
+]]
+
+-- Raid_FindTarget: Raid-Ziel suchen
+RemoteIndex.Get("Raid_FindTarget").OnServerInvoke = function(player)
+    -- Vorprüfung
+    local canRaid, reason = RaidSystem.CanRaid(player)
+    if not canRaid then
+        return { Success = false, Error = reason }
     end
     
-    -- Prüfen ob alle Helden dem Spieler gehören
-    for _, heroInstanceId in ipairs(teamIds) do
-        if not data.Heroes.Owned[heroInstanceId] then
-            return { Success = false, Error = "Held nicht im Besitz: " .. heroInstanceId }
-        end
+    local success, result = RaidSystem.FindTarget(player)
+    
+    if success then
+        return {
+            Success = true,
+            IsNPC = result.IsNPC,
+            TargetName = result.TargetData.Dungeon.Name,
+            TargetLevel = result.TargetData.Dungeon.Level,
+            RoomCount = #result.TargetData.Dungeon.Rooms,
+            -- TargetData für StartRaid zwischenspeichern
+            TargetInfo = result,
+        }
+    else
+        return { Success = false, Error = result }
+    end
+end
+
+-- Raid_Start: Raid starten
+RemoteIndex.Get("Raid_Start").OnServerInvoke = function(player, targetInfo)
+    if not targetInfo then
+        return { Success = false, Error = "Kein Ziel ausgewählt" }
     end
     
-    -- Team setzen
-    DataManager.SetValue(player, "Heroes.Team", teamIds)
+    local success, result = RaidSystem.StartRaid(player, targetInfo)
     
-    RemoteIndex.FireClient("Heroes_Update", player, {
-        Team = teamIds,
+    if success then
+        return {
+            Success = true,
+            RaidId = result.RaidId,
+            TargetName = result.TargetName,
+            TotalRooms = result.TotalRooms,
+        }
+    else
+        return { Success = false, Error = result }
+    end
+end
+
+--[[
+    =============================================
+    PRESTIGE
+    =============================================
+]]
+
+-- Prestige_Info: Prestige-Info abfragen
+RemoteIndex.Get("Prestige_Info").OnServerInvoke = function(player)
+    local data = DataManager.GetData(player)
+    if not data then
+        return { Success = false, Error = "Daten nicht geladen" }
+    end
+    
+    local currentLevel = data.Prestige.Level or 0
+    local dungeonLevel = data.Dungeon.Level or 1
+    local requiredLevel = GameConfig.Prestige.RequiredDungeonLevel
+    local canPrestige = dungeonLevel >= requiredLevel
+    
+    local nextBonus = (currentLevel + 1) * GameConfig.Prestige.BonusPerPrestige
+    local totalBonus = currentLevel * GameConfig.Prestige.BonusPerPrestige
+    
+    return {
+        Success = true,
+        CurrentLevel = currentLevel,
+        TotalBonus = totalBonus,
+        NextBonus = nextBonus,
+        CanPrestige = canPrestige,
+        RequiredDungeonLevel = requiredLevel,
+        CurrentDungeonLevel = dungeonLevel,
+    }
+end
+
+-- Prestige_Execute: Prestige durchführen
+RemoteIndex.Get("Prestige_Execute").OnServerInvoke = function(player)
+    local data = DataManager.GetData(player)
+    if not data then
+        return { Success = false, Error = "Daten nicht geladen" }
+    end
+    
+    local dungeonLevel = data.Dungeon.Level or 1
+    local requiredLevel = GameConfig.Prestige.RequiredDungeonLevel
+    
+    if dungeonLevel < requiredLevel then
+        return { Success = false, Error = "Dungeon-Level " .. requiredLevel .. " benötigt" }
+    end
+    
+    local maxPrestige = GameConfig.Prestige.MaxPrestige
+    local currentPrestige = data.Prestige.Level or 0
+    
+    if currentPrestige >= maxPrestige then
+        return { Success = false, Error = "Maximales Prestige erreicht" }
+    end
+    
+    -- Prestige durchführen
+    local newPrestigeLevel = currentPrestige + 1
+    local newBonus = newPrestigeLevel * GameConfig.Prestige.BonusPerPrestige
+    
+    -- Prestige-Daten setzen
+    DataManager.SetValue(player, "Prestige.Level", newPrestigeLevel)
+    DataManager.SetValue(player, "Prestige.TotalBonusPercent", newBonus)
+    
+    -- Dungeon zurücksetzen (aber Freischaltungen behalten)
+    DataManager.SetValue(player, "Dungeon.Level", 1)
+    DataManager.SetValue(player, "Dungeon.Experience", 0)
+    
+    -- Starter-Räume zurücksetzen
+    local starterRooms = {
+        [1] = { RoomId = "stone_corridor", Level = 1, Traps = {}, Monsters = {} },
+        [2] = { RoomId = "stone_corridor", Level = 1, Traps = {}, Monsters = {} },
+        [3] = { RoomId = "guard_chamber", Level = 1, Traps = {}, Monsters = {} },
+    }
+    DataManager.SetValue(player, "Dungeon.Rooms", starterRooms)
+    
+    -- Währung zurücksetzen auf Startwerte
+    DataManager.SetValue(player, "Currency.Gold", GameConfig.Currency.StartingGold)
+    DataManager.SetValue(player, "Currency.Gems", GameConfig.Currency.StartingGems)
+    
+    -- Helden behalten, aber Team leeren
+    DataManager.SetValue(player, "Heroes.Team", {})
+    
+    -- Client über Änderungen informieren
+    RemoteIndex.FireClient("Currency_Update", player, {
+        Gold = GameConfig.Currency.StartingGold,
+        Gems = GameConfig.Currency.StartingGems,
+        Source = "Prestige",
     })
     
-    return { Success = true }
+    RemoteIndex.FireClient("Dungeon_Update", player, {
+        Level = 1,
+        Experience = 0,
+        Rooms = starterRooms,
+    })
+    
+    RemoteIndex.FireClient("Heroes_Update", player, {
+        Owned = data.Heroes.Owned,
+        Team = {},
+        Unlocked = data.Heroes.Unlocked,
+    })
+    
+    -- Benachrichtigung
+    PlayerManager.SendNotification(
+        player,
+        "Prestige " .. newPrestigeLevel .. "!",
+        "+" .. math.floor(newBonus * 100) .. "% Bonus auf alles!",
+        "Success"
+    )
+    
+    return {
+        Success = true,
+        NewPrestigeLevel = newPrestigeLevel,
+        TotalBonus = newBonus,
+    }
 end
 
 --[[
@@ -822,7 +629,266 @@ RemoteIndex.Get("Player_SettingsUpdate").OnServerInvoke = function(player, setti
     return { Success = true }
 end
 
+--[[
+    =============================================
+    TUTORIAL & ACHIEVEMENTS
+    =============================================
+]]
+
+-- Tutorial_Complete: Tutorial-Schritt abschließen
+RemoteIndex.Get("Tutorial_Complete").OnServerInvoke = function(player, stepName)
+    local data = DataManager.GetData(player)
+    if not data then
+        return { Success = false, Error = "Daten nicht geladen" }
+    end
+    
+    -- Gültige Schritte
+    local validSteps = { "Intro", "FirstRoom", "FirstTrap", "FirstMonster", "FirstRaid", "FirstDefense" }
+    local isValid = false
+    
+    for _, step in ipairs(validSteps) do
+        if step == stepName then
+            isValid = true
+            break
+        end
+    end
+    
+    if not isValid then
+        return { Success = false, Error = "Ungültiger Tutorial-Schritt" }
+    end
+    
+    -- Bereits abgeschlossen?
+    if data.Progress.Tutorial[stepName] then
+        return { Success = false, Error = "Bereits abgeschlossen" }
+    end
+    
+    DataManager.SetValue(player, "Progress.Tutorial." .. stepName, true)
+    
+    -- Belohnung je nach Schritt
+    local rewards = {
+        Intro = { Gold = 100, Gems = 0 },
+        FirstRoom = { Gold = 200, Gems = 0 },
+        FirstTrap = { Gold = 150, Gems = 0 },
+        FirstMonster = { Gold = 150, Gems = 0 },
+        FirstRaid = { Gold = 500, Gems = 5 },
+        FirstDefense = { Gold = 300, Gems = 3 },
+    }
+    
+    local reward = rewards[stepName]
+    if reward then
+        CurrencyService.GiveReward(
+            player,
+            reward,
+            CurrencyService.TransactionType.AchievementReward,
+            "Tutorial:" .. stepName
+        )
+    end
+    
+    return {
+        Success = true,
+        Reward = reward,
+    }
+end
+
+--[[
+    =============================================
+    INBOX & REWARDS
+    =============================================
+]]
+
+-- Inbox_Claim: Belohnung abholen
+RemoteIndex.Get("Inbox_Claim").OnServerInvoke = function(player, rewardId)
+    local data = DataManager.GetData(player)
+    if not data then
+        return { Success = false, Error = "Daten nicht geladen" }
+    end
+    
+    -- Belohnung finden
+    local inbox = data.Inbox or {}
+    local rewardIndex = nil
+    local reward = nil
+    
+    for i, item in ipairs(inbox) do
+        if item.Id == rewardId then
+            rewardIndex = i
+            reward = item
+            break
+        end
+    end
+    
+    if not reward then
+        return { Success = false, Error = "Belohnung nicht gefunden" }
+    end
+    
+    if reward.Claimed then
+        return { Success = false, Error = "Bereits abgeholt" }
+    end
+    
+    -- Abgelaufen?
+    if reward.ExpiresAt and os.time() > reward.ExpiresAt then
+        return { Success = false, Error = "Belohnung abgelaufen" }
+    end
+    
+    -- Belohnung geben
+    local actualReward = CurrencyService.GiveReward(
+        player,
+        reward.Rewards or {},
+        CurrencyService.TransactionType.AchievementReward,
+        "Inbox:" .. rewardId
+    )
+    
+    -- Als abgeholt markieren oder entfernen
+    table.remove(inbox, rewardIndex)
+    DataManager.SetValue(player, "Inbox", inbox)
+    
+    -- Client updaten
+    RemoteIndex.FireClient("Inbox_Update", player, inbox)
+    
+    return {
+        Success = true,
+        Reward = actualReward,
+    }
+end
+
+-- Inbox_ClaimAll: Alle abholen
+RemoteIndex.Get("Inbox_ClaimAll").OnServerInvoke = function(player)
+    local data = DataManager.GetData(player)
+    if not data then
+        return { Success = false, Error = "Daten nicht geladen" }
+    end
+    
+    local inbox = data.Inbox or {}
+    local totalReward = { Gold = 0, Gems = 0 }
+    local claimedCount = 0
+    local newInbox = {}
+    
+    for _, item in ipairs(inbox) do
+        local canClaim = not item.Claimed
+        
+        -- Abgelaufen?
+        if item.ExpiresAt and os.time() > item.ExpiresAt then
+            canClaim = false
+        end
+        
+        if canClaim and item.Rewards then
+            -- Belohnung geben
+            local actualReward = CurrencyService.GiveReward(
+                player,
+                item.Rewards,
+                CurrencyService.TransactionType.AchievementReward,
+                "Inbox:" .. item.Id
+            )
+            
+            totalReward.Gold = totalReward.Gold + (actualReward.Gold or 0)
+            totalReward.Gems = totalReward.Gems + (actualReward.Gems or 0)
+            claimedCount = claimedCount + 1
+        else
+            -- Nicht abholbar, behalten
+            table.insert(newInbox, item)
+        end
+    end
+    
+    DataManager.SetValue(player, "Inbox", newInbox)
+    
+    -- Client updaten
+    RemoteIndex.FireClient("Inbox_Update", player, newInbox)
+    
+    return {
+        Success = true,
+        ClaimedCount = claimedCount,
+        TotalReward = totalReward,
+    }
+end
+
+--[[
+    =============================================
+    DEBUG (Nur im Debug-Modus)
+    =============================================
+]]
+
+-- Debug_Command: Debug-Befehle
+RemoteIndex.Get("Debug_Command").OnServerInvoke = function(player, command, ...)
+    if not GameConfig.Debug.Enabled then
+        return { Success = false, Error = "Debug-Modus nicht aktiviert" }
+    end
+    
+    local args = {...}
+    
+    if command == "AddGold" then
+        local amount = args[1] or 1000
+        CurrencyService.AddGold(player, amount, CurrencyService.TransactionType.AdminGrant, "Debug")
+        return { Success = true, Message = "+" .. amount .. " Gold" }
+        
+    elseif command == "AddGems" then
+        local amount = args[1] or 100
+        CurrencyService.AddGems(player, amount, CurrencyService.TransactionType.AdminGrant, "Debug")
+        return { Success = true, Message = "+" .. amount .. " Gems" }
+        
+    elseif command == "SetLevel" then
+        local level = args[1] or 10
+        DataManager.SetValue(player, "Dungeon.Level", level)
+        RemoteIndex.FireClient("Dungeon_Update", player, { Level = level })
+        return { Success = true, Message = "Level = " .. level }
+        
+    elseif command == "ResetData" then
+        DataManager.ResetData(player)
+        return { Success = true, Message = "Daten zurückgesetzt" }
+        
+    elseif command == "UnlockAll" then
+        local data = DataManager.GetData(player)
+        if data then
+            -- Alle Fallen freischalten
+            for trapId, _ in pairs(TrapConfig.Traps) do
+                data.Dungeon.UnlockedTraps[trapId] = true
+            end
+            DataManager.SetValue(player, "Dungeon.UnlockedTraps", data.Dungeon.UnlockedTraps)
+            
+            -- Alle Monster freischalten
+            for monsterId, config in pairs(MonsterConfig.Monsters) do
+                if config.Purchasable ~= false then
+                    data.Dungeon.UnlockedMonsters[monsterId] = true
+                end
+            end
+            DataManager.SetValue(player, "Dungeon.UnlockedMonsters", data.Dungeon.UnlockedMonsters)
+            
+            -- Alle Helden freischalten
+            for heroId, _ in pairs(HeroConfig.Heroes) do
+                data.Heroes.Unlocked[heroId] = true
+            end
+            DataManager.SetValue(player, "Heroes.Unlocked", data.Heroes.Unlocked)
+            
+            -- Client updaten
+            RemoteIndex.FireClient("Dungeon_Update", player, {
+                UnlockedTraps = data.Dungeon.UnlockedTraps,
+                UnlockedMonsters = data.Dungeon.UnlockedMonsters,
+            })
+            RemoteIndex.FireClient("Heroes_Update", player, {
+                Unlocked = data.Heroes.Unlocked,
+            })
+        end
+        return { Success = true, Message = "Alles freigeschaltet" }
+        
+    elseif command == "SkipCooldown" then
+        DataManager.SetValue(player, "Cooldowns.LastRaidTime", 0)
+        return { Success = true, Message = "Raid-Cooldown zurückgesetzt" }
+        
+    else
+        return { Success = false, Error = "Unbekannter Befehl: " .. tostring(command) }
+    end
+end
+
 print("[ServerMain] Remote Handler verbunden!")
+
+-------------------------------------------------
+-- RAID-SYSTEM EVENTS VERBINDEN
+-------------------------------------------------
+
+-- XP nach Raid verteilen
+RaidSystem.Signals.RaidEnded:Connect(function(player, result)
+    HeroSystem.DistributeRaidXP(player, result)
+end)
+
+print("[ServerMain] System-Events verbunden!")
 
 -------------------------------------------------
 -- GAMELOOP STARTEN
