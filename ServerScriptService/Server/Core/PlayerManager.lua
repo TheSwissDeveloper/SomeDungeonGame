@@ -1,19 +1,18 @@
 --[[
     PlayerManager.lua
-    Spieler-Lifecycle Management für "Dungeon Tycoon"
+    Spieler-Lifecycle Management
     Pfad: ServerScriptService/Server/Core/PlayerManager
     
     Verantwortlich für:
     - Spieler Join/Leave Handling
-    - Koordination mit DataManager
-    - Initiale Client-Updates
     - Session-Tracking
+    - Benachrichtigungen an Spieler
+    - Spieler-bezogene Utilities
     
-    WICHTIG: Nur vom Server verwenden!
+    WICHTIG: Arbeitet eng mit DataManager zusammen!
 ]]
 
 local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 -- Auf Shared-Module warten
@@ -27,7 +26,7 @@ local SignalUtil = require(ModulesPath:WaitForChild("SignalUtil"))
 local GameConfig = require(ConfigPath:WaitForChild("GameConfig"))
 local RemoteIndex = require(RemotesPath:WaitForChild("RemoteIndex"))
 
--- DataManager wird später geladen (zirkuläre Abhängigkeit vermeiden)
+-- DataManager-Referenz (wird bei Initialize gesetzt)
 local DataManager = nil
 
 local PlayerManager = {}
@@ -36,237 +35,178 @@ local PlayerManager = {}
 -- KONFIGURATION
 -------------------------------------------------
 local CONFIG = {
-    -- Timeout für Daten-Laden (Sekunden)
-    LoadTimeout = 30,
+    -- Session Timeout (für AFK-Erkennung)
+    AFKTimeout = 600,           -- 10 Minuten
+    AFKCheckInterval = 60,      -- Jede Minute prüfen
     
-    -- Debug-Modus
+    -- Willkommensnachricht
+    ShowWelcomeMessage = true,
+    WelcomeDelay = 2,           -- Sekunden nach Join
+    
+    -- Debug
     Debug = GameConfig.Debug.Enabled,
 }
 
 -------------------------------------------------
 -- INTERNER STATE
 -------------------------------------------------
-local activeSessions = {}       -- { [UserId] = { JoinTime, LastActivity, ... } }
-local isInitialized = false
-local isShuttingDown = false
+local activeSessions = {}       -- { [UserId] = SessionData }
+local playerCount = 0
 
 -------------------------------------------------
 -- SIGNALS
 -------------------------------------------------
 PlayerManager.Signals = {
-    PlayerReady = SignalUtil.new(),         -- (player, data) - Spieler vollständig geladen
-    PlayerLeaving = SignalUtil.new(),       -- (player) - Spieler verlässt
-    PlayerKicked = SignalUtil.new(),        -- (player, reason) - Spieler gekickt
-    SessionUpdated = SignalUtil.new(),      -- (player, sessionData) - Session aktualisiert
+    PlayerJoined = SignalUtil.new(),        -- (player)
+    PlayerLeft = SignalUtil.new(),          -- (player)
+    PlayerReady = SignalUtil.new(),         -- (player, data)
+    PlayerAFK = SignalUtil.new(),           -- (player)
+    PlayerReturned = SignalUtil.new(),      -- (player)
 }
 
 -------------------------------------------------
 -- PRIVATE HILFSFUNKTIONEN
 -------------------------------------------------
 
--- Debug-Logging
 local function debugPrint(...)
     if CONFIG.Debug then
         print("[PlayerManager]", ...)
     end
 end
 
--- Warnung ausgeben
 local function debugWarn(...)
     warn("[PlayerManager]", ...)
 end
 
 --[[
-    Erstellt eine neue Session für einen Spieler
+    Erstellt Session-Daten für einen Spieler
     @param player: Der Spieler
-    @return: Session-Daten
+    @return: SessionData
 ]]
-local function createSession(player)
-    local session = {
+local function createSessionData(player)
+    return {
         UserId = player.UserId,
-        Name = player.Name,
         JoinTime = os.time(),
         LastActivity = os.time(),
+        IsAFK = false,
         IsReady = false,
-        DataLoaded = false,
+        Character = nil,
     }
-    
-    activeSessions[player.UserId] = session
-    debugPrint("Session erstellt für " .. player.Name)
-    
-    return session
 end
 
 --[[
-    Aktualisiert die letzte Aktivität eines Spielers
+    Sendet Willkommensnachricht
     @param player: Der Spieler
+    @param isNewPlayer: Ob es ein neuer Spieler ist
 ]]
-local function updateActivity(player)
-    local session = activeSessions[player.UserId]
-    if session then
-        session.LastActivity = os.time()
-    end
-end
-
---[[
-    Sendet initiale Daten an den Client
-    @param player: Der Spieler
-    @param data: Die Spielerdaten
-]]
-local function sendInitialData(player, data)
-    -- Prüfen ob Spieler noch verbunden
-    if not player or not player.Parent then
-        return
-    end
+local function sendWelcomeMessage(player, isNewPlayer)
+    if not CONFIG.ShowWelcomeMessage then return end
     
-    debugPrint("Sende initiale Daten an " .. player.Name)
-    
-    -- Währung senden
-    RemoteIndex.FireClient("Currency_Update", player, {
-        Gold = data.Currency.Gold,
-        Gems = data.Currency.Gems,
-    })
-    
-    -- Dungeon-Daten senden
-    RemoteIndex.FireClient("Dungeon_Update", player, {
-        Level = data.Dungeon.Level,
-        Experience = data.Dungeon.Experience,
-        Name = data.Dungeon.Name,
-        Rooms = data.Dungeon.Rooms,
-        UnlockedTraps = data.Dungeon.UnlockedTraps,
-        UnlockedMonsters = data.Dungeon.UnlockedMonsters,
-    })
-    
-    -- Helden-Daten senden
-    RemoteIndex.FireClient("Heroes_Update", player, {
-        Owned = data.Heroes.Owned,
-        Team = data.Heroes.Team,
-        Unlocked = data.Heroes.Unlocked,
-    })
-    
-    -- Stats senden
-    RemoteIndex.FireClient("Player_StatsUpdate", player, data.Stats)
-    
-    -- Inbox senden
-    RemoteIndex.FireClient("Inbox_Update", player, data.Inbox)
-    
-    -- DataLoaded Event
-    RemoteIndex.FireClient("Player_DataLoaded", player, {
-        Success = true,
-        Prestige = data.Prestige,
-        Settings = data.Settings,
-        Tutorial = data.Progress.Tutorial,
-    })
-end
-
---[[
-    Handler wenn Spielerdaten geladen wurden
-    @param player: Der Spieler
-    @param data: Die geladenen Daten
-]]
-local function onDataLoaded(player, data)
-    local session = activeSessions[player.UserId]
-    if not session then
-        debugWarn("Keine Session für " .. player.Name .. " bei DataLoaded")
-        return
-    end
-    
-    -- Session aktualisieren
-    session.DataLoaded = true
-    session.IsReady = true
-    
-    -- Initiale Daten an Client senden
-    sendInitialData(player, data)
-    
-    -- Signal feuern
-    PlayerManager.Signals.PlayerReady:Fire(player, data)
-    PlayerManager.Signals.SessionUpdated:Fire(player, session)
-    
-    debugPrint("Spieler bereit: " .. player.Name)
-end
-
---[[
-    Handler wenn Daten-Laden fehlschlägt
-    @param player: Der Spieler
-    @param errorMessage: Fehlermeldung
-]]
-local function onDataLoadFailed(player, errorMessage)
-    local session = activeSessions[player.UserId]
-    if session then
-        session.DataLoaded = false
-        session.IsReady = false
-    end
-    
-    debugWarn("Daten-Laden fehlgeschlagen für " .. player.Name .. ": " .. errorMessage)
-    
-    -- Client informieren
-    if player and player.Parent then
-        RemoteIndex.FireClient("Player_DataLoaded", player, {
-            Success = false,
-            Error = errorMessage,
-        })
-    end
-end
-
--------------------------------------------------
--- SPIELER JOIN/LEAVE HANDLER
--------------------------------------------------
-
---[[
-    Handler wenn ein Spieler dem Spiel beitritt
-    @param player: Der neue Spieler
-]]
-local function onPlayerAdded(player)
-    debugPrint("Spieler beigetreten: " .. player.Name .. " (ID: " .. player.UserId .. ")")
-    
-    -- Session erstellen
-    local session = createSession(player)
-    
-    -- Daten laden (async)
-    task.spawn(function()
-        -- Kurz warten damit Client bereit ist
-        task.wait(1)
+    task.delay(CONFIG.WelcomeDelay, function()
+        if not player or not player.Parent then return end
         
-        -- Prüfen ob Spieler noch da ist
-        if not player or not player.Parent then
-            debugPrint("Spieler " .. session.Name .. " hat vor Daten-Laden verlassen")
-            activeSessions[session.UserId] = nil
-            return
-        end
-        
-        -- DataManager aufrufen
-        if DataManager then
-            DataManager.LoadPlayer(player)
+        if isNewPlayer then
+            PlayerManager.SendNotification(
+                player,
+                "Willkommen bei Dungeon Tycoon!",
+                "Baue deinen Dungeon und verteidige ihn gegen Angreifer!",
+                "Info"
+            )
         else
-            debugWarn("DataManager nicht verfügbar!")
-            onDataLoadFailed(player, "Interner Fehler: DataManager nicht initialisiert")
+            local data = DataManager and DataManager.GetData(player)
+            if data then
+                local level = data.Dungeon.Level or 1
+                PlayerManager.SendNotification(
+                    player,
+                    "Willkommen zurück!",
+                    "Dein Dungeon ist Level " .. level,
+                    "Success"
+                )
+            end
         end
     end)
 end
 
+-------------------------------------------------
+-- SPIELER EVENT HANDLER
+-------------------------------------------------
+
 --[[
-    Handler wenn ein Spieler das Spiel verlässt
-    @param player: Der Spieler der verlässt
+    Handler für Spieler-Join
+    @param player: Der beigetretene Spieler
+]]
+local function onPlayerAdded(player)
+    debugPrint(player.Name .. " ist beigetreten")
+    
+    -- Session erstellen
+    activeSessions[player.UserId] = createSessionData(player)
+    playerCount = playerCount + 1
+    
+    -- Signal feuern
+    PlayerManager.Signals.PlayerJoined:Fire(player)
+    
+    -- Daten laden (über DataManager)
+    if DataManager then
+        DataManager.LoadPlayer(player)
+        
+        -- Auf Daten warten
+        DataManager.Signals.PlayerDataLoaded:Connect(function(loadedPlayer, data)
+            if loadedPlayer == player then
+                local session = activeSessions[player.UserId]
+                if session then
+                    session.IsReady = true
+                end
+                
+                -- Prüfen ob neuer Spieler
+                local isNewPlayer = data.Stats.TotalPlayTime == 0
+                
+                -- Willkommensnachricht
+                sendWelcomeMessage(player, isNewPlayer)
+                
+                -- Signal feuern
+                PlayerManager.Signals.PlayerReady:Fire(player, data)
+                
+                debugPrint(player.Name .. " ist bereit (Level " .. (data.Dungeon.Level or 1) .. ")")
+            end
+        end)
+    end
+    
+    -- Character-Handling
+    player.CharacterAdded:Connect(function(character)
+        local session = activeSessions[player.UserId]
+        if session then
+            session.Character = character
+        end
+    end)
+    
+    -- Aktivitäts-Tracking
+    player.Chatted:Connect(function()
+        PlayerManager.UpdateActivity(player)
+    end)
+end
+
+--[[
+    Handler für Spieler-Leave
+    @param player: Der verlassende Spieler
 ]]
 local function onPlayerRemoving(player)
-    debugPrint("Spieler verlässt: " .. player.Name)
+    debugPrint(player.Name .. " verlässt")
     
-    -- Signal feuern bevor Cleanup
-    PlayerManager.Signals.PlayerLeaving:Fire(player)
+    -- Signal feuern (vor Cleanup!)
+    PlayerManager.Signals.PlayerLeft:Fire(player)
     
-    -- DataManager aufrufen
+    -- Daten speichern und entladen
     if DataManager then
         DataManager.UnloadPlayer(player)
     end
     
     -- Session entfernen
     activeSessions[player.UserId] = nil
-    
-    debugPrint("Spieler entfernt: " .. player.Name)
+    playerCount = playerCount - 1
 end
 
 -------------------------------------------------
--- PUBLIC API
+-- PUBLIC API - INITIALISIERUNG
 -------------------------------------------------
 
 --[[
@@ -274,23 +214,11 @@ end
     @param dataManagerRef: Referenz zum DataManager
 ]]
 function PlayerManager.Initialize(dataManagerRef)
-    if isInitialized then
-        debugWarn("PlayerManager bereits initialisiert!")
-        return
-    end
-    
     debugPrint("Initialisiere PlayerManager...")
     
-    -- DataManager Referenz speichern
     DataManager = dataManagerRef
     
-    -- DataManager Signals verbinden
-    if DataManager and DataManager.Signals then
-        DataManager.Signals.PlayerDataLoaded:Connect(onDataLoaded)
-        DataManager.Signals.DataLoadFailed:Connect(onDataLoadFailed)
-    end
-    
-    -- Player Events verbinden
+    -- Events verbinden
     Players.PlayerAdded:Connect(onPlayerAdded)
     Players.PlayerRemoving:Connect(onPlayerRemoving)
     
@@ -301,26 +229,82 @@ function PlayerManager.Initialize(dataManagerRef)
         end)
     end
     
-    -- BindToClose für graceful shutdown
-    game:BindToClose(function()
-        PlayerManager.OnServerShutdown()
+    -- AFK-Check Loop starten
+    task.spawn(function()
+        while true do
+            task.wait(CONFIG.AFKCheckInterval)
+            PlayerManager._checkAFKPlayers()
+        end
     end)
     
-    isInitialized = true
     debugPrint("PlayerManager initialisiert!")
 end
 
+-------------------------------------------------
+-- PUBLIC API - NOTIFICATIONS
+-------------------------------------------------
+
 --[[
-    Gibt die Session eines Spielers zurück
+    Sendet Benachrichtigung an Spieler
+    @param player: Ziel-Spieler
+    @param title: Titel der Benachrichtigung
+    @param message: Nachricht
+    @param notifType: Typ (Success, Error, Warning, Info)
+]]
+function PlayerManager.SendNotification(player, title, message, notifType)
+    if not player or not player.Parent then return end
+    
+    RemoteIndex.FireClient("Notification", player, {
+        Title = title or "Benachrichtigung",
+        Message = message or "",
+        Type = notifType or "Info",
+    })
+end
+
+--[[
+    Sendet Benachrichtigung an alle Spieler
+    @param title: Titel
+    @param message: Nachricht
+    @param notifType: Typ
+]]
+function PlayerManager.BroadcastNotification(title, message, notifType)
+    RemoteIndex.FireAllClients("Notification", {
+        Title = title or "Benachrichtigung",
+        Message = message or "",
+        Type = notifType or "Info",
+    })
+end
+
+--[[
+    Sendet Benachrichtigung an alle außer einen Spieler
+    @param excludePlayer: Spieler der ausgeschlossen wird
+    @param title: Titel
+    @param message: Nachricht
+    @param notifType: Typ
+]]
+function PlayerManager.BroadcastExcept(excludePlayer, title, message, notifType)
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= excludePlayer then
+            PlayerManager.SendNotification(player, title, message, notifType)
+        end
+    end
+end
+
+-------------------------------------------------
+-- PUBLIC API - SESSION MANAGEMENT
+-------------------------------------------------
+
+--[[
+    Gibt Session-Daten eines Spielers zurück
     @param player: Der Spieler
-    @return: Session-Daten oder nil
+    @return: SessionData oder nil
 ]]
 function PlayerManager.GetSession(player)
     return activeSessions[player.UserId]
 end
 
 --[[
-    Prüft ob ein Spieler vollständig geladen ist
+    Prüft ob Spieler bereit ist (Daten geladen)
     @param player: Der Spieler
     @return: boolean
 ]]
@@ -330,173 +314,198 @@ function PlayerManager.IsPlayerReady(player)
 end
 
 --[[
-    Gibt alle aktiven Sessions zurück
-    @return: Table mit Sessions
-]]
-function PlayerManager.GetAllSessions()
-    return activeSessions
-end
-
---[[
-    Gibt die Anzahl aktiver Spieler zurück
-    @return: Anzahl
-]]
-function PlayerManager.GetPlayerCount()
-    local count = 0
-    for _ in pairs(activeSessions) do
-        count = count + 1
-    end
-    return count
-end
-
---[[
-    Kickt einen Spieler mit Grund
+    Aktualisiert letzte Aktivität eines Spielers
     @param player: Der Spieler
-    @param reason: Grund für den Kick
 ]]
-function PlayerManager.KickPlayer(player, reason)
-    reason = reason or "Du wurdest vom Server entfernt."
-    
-    debugPrint("Kicke Spieler: " .. player.Name .. " - Grund: " .. reason)
-    
-    -- Signal feuern
-    PlayerManager.Signals.PlayerKicked:Fire(player, reason)
-    
-    -- Spieler kicken
-    player:Kick(reason)
-end
-
---[[
-    Aktualisiert Session-Daten eines Spielers
-    @param player: Der Spieler
-    @param key: Der Key der aktualisiert werden soll
-    @param value: Der neue Wert
-]]
-function PlayerManager.UpdateSession(player, key, value)
+function PlayerManager.UpdateActivity(player)
     local session = activeSessions[player.UserId]
     if session then
-        session[key] = value
+        local wasAFK = session.IsAFK
         session.LastActivity = os.time()
-        PlayerManager.Signals.SessionUpdated:Fire(player, session)
+        session.IsAFK = false
+        
+        if wasAFK then
+            PlayerManager.Signals.PlayerReturned:Fire(player)
+            debugPrint(player.Name .. " ist zurück vom AFK")
+        end
     end
 end
 
 --[[
-    Sendet eine Benachrichtigung an einen Spieler
+    Prüft ob Spieler AFK ist
     @param player: Der Spieler
-    @param title: Titel der Benachrichtigung
-    @param message: Nachricht
-    @param notificationType: Typ (Info, Success, Warning, Error)
+    @return: boolean
 ]]
-function PlayerManager.SendNotification(player, title, message, notificationType)
-    notificationType = notificationType or "Info"
+function PlayerManager.IsAFK(player)
+    local session = activeSessions[player.UserId]
+    return session ~= nil and session.IsAFK
+end
+
+--[[
+    Interner AFK-Check (vom Loop aufgerufen)
+]]
+function PlayerManager._checkAFKPlayers()
+    local currentTime = os.time()
     
-    RemoteIndex.FireClient("UI_Notification", player, {
-        Title = title,
-        Message = message,
-        Type = notificationType,
-    })
-end
-
---[[
-    Sendet eine Fehlermeldung an einen Spieler
-    @param player: Der Spieler
-    @param message: Fehlermeldung
-]]
-function PlayerManager.SendError(player, message)
-    RemoteIndex.FireClient("UI_Error", player, {
-        Message = message,
-    })
-end
-
---[[
-    Sendet ein Update an einen Spieler (generisch)
-    @param player: Der Spieler
-    @param updateType: Typ des Updates (Currency, Dungeon, Heroes, etc.)
-    @param data: Die Daten
-]]
-function PlayerManager.SendUpdate(player, updateType, data)
-    local remoteName = updateType .. "_Update"
-    
-    if RemoteIndex.Exists(remoteName) then
-        RemoteIndex.FireClient(remoteName, player, data)
-    else
-        debugWarn("Unbekannter Update-Typ: " .. updateType)
-    end
-end
-
---[[
-    Broadcast an alle Spieler
-    @param remoteName: Name des RemoteEvents
-    @param data: Die Daten
-]]
-function PlayerManager.BroadcastToAll(remoteName, data)
-    if RemoteIndex.Exists(remoteName) and RemoteIndex.GetType(remoteName) == "Event" then
-        RemoteIndex.FireAllClients(remoteName, data)
-    else
-        debugWarn("Ungültiges Remote für Broadcast: " .. remoteName)
-    end
-end
-
---[[
-    Sendet an alle bereiten Spieler
-    @param remoteName: Name des RemoteEvents
-    @param data: Die Daten
-]]
-function PlayerManager.BroadcastToReady(remoteName, data)
     for userId, session in pairs(activeSessions) do
-        if session.IsReady then
-            local player = Players:GetPlayerByUserId(userId)
-            if player then
-                RemoteIndex.FireClient(remoteName, player, data)
+        if not session.IsAFK then
+            local inactiveTime = currentTime - session.LastActivity
+            
+            if inactiveTime >= CONFIG.AFKTimeout then
+                session.IsAFK = true
+                
+                local player = Players:GetPlayerByUserId(userId)
+                if player then
+                    PlayerManager.Signals.PlayerAFK:Fire(player)
+                    debugPrint(player.Name .. " ist jetzt AFK")
+                end
             end
         end
     end
 end
 
+-------------------------------------------------
+-- PUBLIC API - SPIELER ABFRAGEN
+-------------------------------------------------
+
 --[[
-    Server-Shutdown Handler
+    Gibt Anzahl aktiver Spieler zurück
+    @return: Spieleranzahl
 ]]
-function PlayerManager.OnServerShutdown()
-    if isShuttingDown then
-        return
-    end
-    
-    debugPrint("Server-Shutdown erkannt...")
-    isShuttingDown = true
-    
-    -- DataManager Shutdown aufrufen
-    if DataManager and DataManager.OnServerShutdown then
-        DataManager.OnServerShutdown()
-    end
-    
-    debugPrint("PlayerManager Shutdown abgeschlossen!")
+function PlayerManager.GetPlayerCount()
+    return playerCount
 end
 
 --[[
-    Gibt Session-Statistiken zurück
-    @return: Statistik-Table
+    Gibt alle aktiven Spieler zurück
+    @return: Array von Spielern
+]]
+function PlayerManager.GetAllPlayers()
+    return Players:GetPlayers()
+end
+
+--[[
+    Gibt alle bereiten Spieler zurück
+    @return: Array von Spielern
+]]
+function PlayerManager.GetReadyPlayers()
+    local readyPlayers = {}
+    
+    for _, player in ipairs(Players:GetPlayers()) do
+        if PlayerManager.IsPlayerReady(player) then
+            table.insert(readyPlayers, player)
+        end
+    end
+    
+    return readyPlayers
+end
+
+--[[
+    Findet Spieler nach Name
+    @param name: Spielername (partiell)
+    @return: Spieler oder nil
+]]
+function PlayerManager.FindPlayerByName(name)
+    name = name:lower()
+    
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player.Name:lower():find(name) then
+            return player
+        end
+    end
+    
+    return nil
+end
+
+--[[
+    Findet Spieler nach UserId
+    @param userId: User-ID
+    @return: Spieler oder nil
+]]
+function PlayerManager.GetPlayerByUserId(userId)
+    return Players:GetPlayerByUserId(userId)
+end
+
+-------------------------------------------------
+-- PUBLIC API - SPIELZEIT
+-------------------------------------------------
+
+--[[
+    Gibt Spielzeit der aktuellen Session zurück
+    @param player: Der Spieler
+    @return: Sekunden oder 0
+]]
+function PlayerManager.GetSessionPlayTime(player)
+    local session = activeSessions[player.UserId]
+    if session then
+        return os.time() - session.JoinTime
+    end
+    return 0
+end
+
+--[[
+    Gibt formatierte Spielzeit zurück
+    @param player: Der Spieler
+    @return: Formatierter String (z.B. "1h 23m")
+]]
+function PlayerManager.GetFormattedPlayTime(player)
+    local seconds = PlayerManager.GetSessionPlayTime(player)
+    
+    local hours = math.floor(seconds / 3600)
+    local minutes = math.floor((seconds % 3600) / 60)
+    
+    if hours > 0 then
+        return string.format("%dh %dm", hours, minutes)
+    else
+        return string.format("%dm", minutes)
+    end
+end
+
+-------------------------------------------------
+-- PUBLIC API - UTILITY
+-------------------------------------------------
+
+--[[
+    Teleportiert Spieler zu Position
+    @param player: Der Spieler
+    @param position: Vector3 oder CFrame
+]]
+function PlayerManager.TeleportPlayer(player, position)
+    local character = player.Character
+    if not character then return end
+    
+    local humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
+    if not humanoidRootPart then return end
+    
+    if typeof(position) == "Vector3" then
+        humanoidRootPart.CFrame = CFrame.new(position)
+    else
+        humanoidRootPart.CFrame = position
+    end
+end
+
+--[[
+    Gibt Statistiken über alle Spieler zurück
+    @return: Stats-Table
 ]]
 function PlayerManager.GetStats()
-    local totalPlayers = 0
-    local readyPlayers = 0
-    local totalSessionTime = 0
-    local currentTime = os.time()
+    local afkCount = 0
+    local readyCount = 0
     
-    for userId, session in pairs(activeSessions) do
-        totalPlayers = totalPlayers + 1
-        
-        if session.IsReady then
-            readyPlayers = readyPlayers + 1
+    for _, session in pairs(activeSessions) do
+        if session.IsAFK then
+            afkCount = afkCount + 1
         end
-        
-        totalSessionTime = totalSessionTime + (currentTime - session.JoinTime)
+        if session.IsReady then
+            readyCount = readyCount + 1
+        end
     end
     
     return {
-        TotalPlayers = totalPlayers,
-        ReadyPlayers = readyPlayers,
-        AverageSessionTime = totalPlayers > 0 and (totalSessionTime / totalPlayers) or 0,
+        TotalPlayers = playerCount,
+        ReadyPlayers = readyCount,
+        AFKPlayers = afkCount,
+        ActivePlayers = playerCount - afkCount,
     }
 end
 
