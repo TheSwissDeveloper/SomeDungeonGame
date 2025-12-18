@@ -1,0 +1,357 @@
+--[[
+    RemoteIndex.lua
+    Zentrale Remote-Verwaltung für Client-Server Kommunikation
+    Pfad: ReplicatedStorage/Shared/Remotes/RemoteIndex
+    
+    WICHTIG: Alle RemoteEvents und RemoteFunctions hier definieren!
+    Keine manuell erstellten Remotes in anderen Scripts.
+    
+    Verwendung:
+    - Server: RemoteIndex.Setup() beim Start aufrufen
+    - Beide: RemoteIndex.Get("RemoteName") zum Abrufen
+    
+    Beispiel:
+        -- Server
+        RemoteIndex.Get("Currency_Update"):FireClient(player, data)
+        
+        -- Client
+        RemoteIndex.Get("Currency_Update").OnClientEvent:Connect(function(data)
+            -- Handle update
+        end)
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local RemoteIndex = {}
+
+-------------------------------------------------
+-- REMOTE-DEFINITIONEN
+-------------------------------------------------
+-- Type: "Event" = RemoteEvent, "Function" = RemoteFunction
+
+RemoteIndex.Remotes = {
+    -------------------------------------------------
+    -- WÄHRUNG & ECONOMY
+    -------------------------------------------------
+    Currency_Update = { Type = "Event" },           -- Server -> Client: Währung geändert
+    Currency_Request = { Type = "Function" },       -- Client -> Server: Währung abfragen
+    Currency_CollectPassive = { Type = "Function" },-- Client -> Server: Passives Einkommen abholen
+    
+    -------------------------------------------------
+    -- DUNGEON BUILDING
+    -------------------------------------------------
+    Dungeon_Update = { Type = "Event" },            -- Server -> Client: Dungeon-Daten geändert
+    Dungeon_AddRoom = { Type = "Function" },        -- Client -> Server: Neuen Raum kaufen
+    Dungeon_UpgradeRoom = { Type = "Function" },    -- Client -> Server: Raum upgraden
+    Dungeon_PlaceTrap = { Type = "Function" },      -- Client -> Server: Falle platzieren
+    Dungeon_RemoveTrap = { Type = "Function" },     -- Client -> Server: Falle entfernen
+    Dungeon_PlaceMonster = { Type = "Function" },   -- Client -> Server: Monster platzieren
+    Dungeon_RemoveMonster = { Type = "Function" },  -- Client -> Server: Monster entfernen
+    Dungeon_Rename = { Type = "Function" },         -- Client -> Server: Dungeon umbenennen
+    
+    -------------------------------------------------
+    -- SHOP & UNLOCKS
+    -------------------------------------------------
+    Shop_UnlockTrap = { Type = "Function" },        -- Client -> Server: Falle freischalten
+    Shop_UnlockMonster = { Type = "Function" },     -- Client -> Server: Monster freischalten
+    Shop_UnlockRoom = { Type = "Function" },        -- Client -> Server: Raum-Typ freischalten
+    Shop_UnlockHero = { Type = "Function" },        -- Client -> Server: Held freischalten
+    Shop_PurchaseGems = { Type = "Function" },      -- Client -> Server: Gems kaufen (Robux)
+    
+    -------------------------------------------------
+    -- HELDEN-MANAGEMENT
+    -------------------------------------------------
+    Heroes_Update = { Type = "Event" },             -- Server -> Client: Helden-Daten geändert
+    Heroes_Recruit = { Type = "Function" },         -- Client -> Server: Held rekrutieren
+    Heroes_SetTeam = { Type = "Function" },         -- Client -> Server: Raid-Team setzen
+    Heroes_Upgrade = { Type = "Function" },         -- Client -> Server: Held upgraden
+    Heroes_Dismiss = { Type = "Function" },         -- Client -> Server: Held entlassen
+    
+    -------------------------------------------------
+    -- RAIDS
+    -------------------------------------------------
+    Raid_FindTarget = { Type = "Function" },        -- Client -> Server: Raid-Ziel suchen
+    Raid_Start = { Type = "Function" },             -- Client -> Server: Raid starten
+    Raid_Update = { Type = "Event" },               -- Server -> Client: Raid-Status Update
+    Raid_End = { Type = "Event" },                  -- Server -> Client: Raid beendet
+    Raid_CombatTick = { Type = "Event" },           -- Server -> Client: Combat-Update
+    
+    -------------------------------------------------
+    -- DEFENSE (Eigener Dungeon wird angegriffen)
+    -------------------------------------------------
+    Defense_Notification = { Type = "Event" },      -- Server -> Client: Jemand greift an
+    Defense_Result = { Type = "Event" },            -- Server -> Client: Ergebnis des Angriffs
+    Defense_Replay = { Type = "Function" },         -- Client -> Server: Replay anfordern
+    
+    -------------------------------------------------
+    -- PRESTIGE
+    -------------------------------------------------
+    Prestige_Info = { Type = "Function" },          -- Client -> Server: Prestige-Info abfragen
+    Prestige_Execute = { Type = "Function" },       -- Client -> Server: Prestige durchführen
+    
+    -------------------------------------------------
+    -- SPIELER-DATEN
+    -------------------------------------------------
+    Player_DataLoaded = { Type = "Event" },         -- Server -> Client: Daten geladen
+    Player_StatsUpdate = { Type = "Event" },        -- Server -> Client: Stats geändert
+    Player_SettingsUpdate = { Type = "Function" },  -- Client -> Server: Einstellungen ändern
+    
+    -------------------------------------------------
+    -- TUTORIAL & ACHIEVEMENTS
+    -------------------------------------------------
+    Tutorial_Complete = { Type = "Function" },      -- Client -> Server: Tutorial-Schritt abschließen
+    Achievement_Unlocked = { Type = "Event" },      -- Server -> Client: Achievement freigeschaltet
+    Achievement_Claim = { Type = "Function" },      -- Client -> Server: Achievement-Belohnung abholen
+    
+    -------------------------------------------------
+    -- INBOX & REWARDS
+    -------------------------------------------------
+    Inbox_Update = { Type = "Event" },              -- Server -> Client: Inbox geändert
+    Inbox_Claim = { Type = "Function" },            -- Client -> Server: Belohnung abholen
+    Inbox_ClaimAll = { Type = "Function" },         -- Client -> Server: Alle abholen
+    
+    -------------------------------------------------
+    -- UI & MISC
+    -------------------------------------------------
+    UI_Notification = { Type = "Event" },           -- Server -> Client: Benachrichtigung anzeigen
+    UI_Error = { Type = "Event" },                  -- Server -> Client: Fehlermeldung anzeigen
+    Debug_Command = { Type = "Function" },          -- Client -> Server: Debug-Befehle (nur Dev)
+}
+
+-------------------------------------------------
+-- INTERNER STATE
+-------------------------------------------------
+local remoteFolder = nil
+local isSetup = false
+local cachedRemotes = {}
+
+-------------------------------------------------
+-- SETUP (NUR SERVER)
+-------------------------------------------------
+
+--[[
+    Erstellt alle Remotes
+    MUSS vom Server beim Start aufgerufen werden!
+]]
+function RemoteIndex.Setup()
+    if not RunService:IsServer() then
+        error("[RemoteIndex] Setup() darf nur vom Server aufgerufen werden!")
+    end
+    
+    if isSetup then
+        warn("[RemoteIndex] Setup() wurde bereits aufgerufen!")
+        return
+    end
+    
+    -- Ordner erstellen oder finden
+    remoteFolder = ReplicatedStorage:FindFirstChild("Remotes")
+    if not remoteFolder then
+        remoteFolder = Instance.new("Folder")
+        remoteFolder.Name = "Remotes"
+        remoteFolder.Parent = ReplicatedStorage
+    end
+    
+    -- Alle Remotes erstellen
+    for name, config in pairs(RemoteIndex.Remotes) do
+        local remote
+        
+        if config.Type == "Event" then
+            remote = Instance.new("RemoteEvent")
+        elseif config.Type == "Function" then
+            remote = Instance.new("RemoteFunction")
+        else
+            warn("[RemoteIndex] Unbekannter Remote-Typ für '" .. name .. "': " .. tostring(config.Type))
+            continue
+        end
+        
+        remote.Name = name
+        remote.Parent = remoteFolder
+        cachedRemotes[name] = remote
+    end
+    
+    isSetup = true
+    print("[RemoteIndex] " .. tostring(#RemoteIndex._getRemoteCount()) .. " Remotes erstellt.")
+end
+
+-------------------------------------------------
+-- GET REMOTE
+-------------------------------------------------
+
+--[[
+    Gibt ein Remote zurück
+    @param name: Name des Remotes (aus RemoteIndex.Remotes)
+    @return: RemoteEvent oder RemoteFunction
+]]
+function RemoteIndex.Get(name)
+    -- Prüfen ob Remote existiert in Definition
+    if not RemoteIndex.Remotes[name] then
+        error("[RemoteIndex] Remote '" .. tostring(name) .. "' ist nicht definiert!")
+    end
+    
+    -- Aus Cache holen
+    if cachedRemotes[name] then
+        return cachedRemotes[name]
+    end
+    
+    -- Ordner finden falls noch nicht vorhanden
+    if not remoteFolder then
+        remoteFolder = ReplicatedStorage:WaitForChild("Remotes", 10)
+        if not remoteFolder then
+            error("[RemoteIndex] Remotes-Ordner nicht gefunden! Server muss Setup() aufrufen.")
+        end
+    end
+    
+    -- Remote finden und cachen
+    local remote = remoteFolder:WaitForChild(name, 10)
+    if not remote then
+        error("[RemoteIndex] Remote '" .. name .. "' nicht gefunden! Server muss Setup() aufrufen.")
+    end
+    
+    cachedRemotes[name] = remote
+    return remote
+end
+
+--[[
+    Gibt ein Remote zurück ohne zu warten (kann nil sein)
+    @param name: Name des Remotes
+    @return: RemoteEvent/RemoteFunction oder nil
+]]
+function RemoteIndex.TryGet(name)
+    if not RemoteIndex.Remotes[name] then
+        return nil
+    end
+    
+    if cachedRemotes[name] then
+        return cachedRemotes[name]
+    end
+    
+    if not remoteFolder then
+        remoteFolder = ReplicatedStorage:FindFirstChild("Remotes")
+        if not remoteFolder then
+            return nil
+        end
+    end
+    
+    local remote = remoteFolder:FindFirstChild(name)
+    if remote then
+        cachedRemotes[name] = remote
+    end
+    
+    return remote
+end
+
+-------------------------------------------------
+-- HILFSFUNKTIONEN
+-------------------------------------------------
+
+--[[
+    Gibt alle Remote-Namen zurück
+    @return: Array von Remote-Namen
+]]
+function RemoteIndex.GetAllNames()
+    local names = {}
+    for name, _ in pairs(RemoteIndex.Remotes) do
+        table.insert(names, name)
+    end
+    table.sort(names)
+    return names
+end
+
+--[[
+    Prüft ob ein Remote existiert
+    @param name: Name des Remotes
+    @return: boolean
+]]
+function RemoteIndex.Exists(name)
+    return RemoteIndex.Remotes[name] ~= nil
+end
+
+--[[
+    Gibt die Anzahl der Remotes zurück
+    @return: Anzahl
+]]
+function RemoteIndex._getRemoteCount()
+    local count = 0
+    for _ in pairs(RemoteIndex.Remotes) do
+        count = count + 1
+    end
+    return count
+end
+
+--[[
+    Gibt den Typ eines Remotes zurück
+    @param name: Name des Remotes
+    @return: "Event" oder "Function" oder nil
+]]
+function RemoteIndex.GetType(name)
+    local config = RemoteIndex.Remotes[name]
+    if config then
+        return config.Type
+    end
+    return nil
+end
+
+-------------------------------------------------
+-- SERVER-HELPER
+-------------------------------------------------
+
+--[[
+    Feuert ein Event an alle Spieler
+    @param name: Name des RemoteEvents
+    @param ...: Argumente
+]]
+function RemoteIndex.FireAllClients(name, ...)
+    local remote = RemoteIndex.Get(name)
+    if RemoteIndex.GetType(name) ~= "Event" then
+        error("[RemoteIndex] FireAllClients nur für Events! '" .. name .. "' ist ein " .. tostring(RemoteIndex.GetType(name)))
+    end
+    remote:FireAllClients(...)
+end
+
+--[[
+    Feuert ein Event an einen Spieler
+    @param name: Name des RemoteEvents
+    @param player: Der Spieler
+    @param ...: Argumente
+]]
+function RemoteIndex.FireClient(name, player, ...)
+    local remote = RemoteIndex.Get(name)
+    if RemoteIndex.GetType(name) ~= "Event" then
+        error("[RemoteIndex] FireClient nur für Events! '" .. name .. "' ist ein " .. tostring(RemoteIndex.GetType(name)))
+    end
+    remote:FireClient(player, ...)
+end
+
+-------------------------------------------------
+-- CLIENT-HELPER
+-------------------------------------------------
+
+--[[
+    Feuert ein Event an den Server
+    @param name: Name des RemoteEvents
+    @param ...: Argumente
+]]
+function RemoteIndex.FireServer(name, ...)
+    local remote = RemoteIndex.Get(name)
+    if RemoteIndex.GetType(name) ~= "Event" then
+        error("[RemoteIndex] FireServer nur für Events! '" .. name .. "' ist ein " .. tostring(RemoteIndex.GetType(name)))
+    end
+    remote:FireServer(...)
+end
+
+--[[
+    Ruft eine Server-Funktion auf
+    @param name: Name der RemoteFunction
+    @param ...: Argumente
+    @return: Rückgabewert der Funktion
+]]
+function RemoteIndex.InvokeServer(name, ...)
+    local remote = RemoteIndex.Get(name)
+    if RemoteIndex.GetType(name) ~= "Function" then
+        error("[RemoteIndex] InvokeServer nur für Functions! '" .. name .. "' ist ein " .. tostring(RemoteIndex.GetType(name)))
+    end
+    return remote:InvokeServer(...)
+end
+
+return RemoteIndex
