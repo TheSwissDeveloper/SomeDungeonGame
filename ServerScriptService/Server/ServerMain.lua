@@ -1,907 +1,852 @@
 --[[
     ServerMain.lua
-    Haupt-Entry-Point für den Server
+    Zentraler Server-Einstiegspunkt
     Pfad: ServerScriptService/Server/ServerMain
     
     Dieses Script:
-    - Initialisiert alle Server-Module in korrekter Reihenfolge
-    - Verbindet Remote-Handler
-    - Startet den GameLoop
+    - Lädt alle Server-Module
+    - Initialisiert in korrekter Reihenfolge
+    - Verbindet Dependencies
+    - Startet GameLoop
     
-    WICHTIG: Dies ist ein SCRIPT, kein ModuleScript!
+    WICHTIG: Dies ist das EINZIGE Server-Script das direkt läuft!
 ]]
 
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerScriptService = game:GetService("ServerScriptService")
-local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
 
-print("[ServerMain] Starte Server-Initialisierung...")
+print("═══════════════════════════════════════════")
+print("    🏰 DUNGEON TYCOON - SERVER START")
+print("═══════════════════════════════════════════")
 
 -------------------------------------------------
--- PFADE DEFINIEREN
+-- PFADE
 -------------------------------------------------
+local ServerPath = ServerScriptService:WaitForChild("Server")
+local CorePath = ServerPath:WaitForChild("Core")
+local ServicesPath = ServerPath:WaitForChild("Services")
+local SystemsPath = ServerPath:WaitForChild("Systems")
+
 local SharedPath = ReplicatedStorage:WaitForChild("Shared")
 local ConfigPath = SharedPath:WaitForChild("Config")
 local ModulesPath = SharedPath:WaitForChild("Modules")
 local RemotesPath = SharedPath:WaitForChild("Remotes")
 
-local ServerPath = ServerScriptService:WaitForChild("Server")
-local CorePath = ServerPath:WaitForChild("Core")
-local SystemsPath = ServerPath:WaitForChild("Systems")
-local ServicesPath = ServerPath:WaitForChild("Services")
-
 -------------------------------------------------
--- SHARED MODULES LADEN
+-- KONFIGURATION
 -------------------------------------------------
-print("[ServerMain] Lade Shared Modules...")
+local DEBUG_MODE = true
+local INIT_TIMEOUT = 30  -- Sekunden
 
-local GameConfig = require(ConfigPath:WaitForChild("GameConfig"))
-local TrapConfig = require(ConfigPath:WaitForChild("TrapConfig"))
-local MonsterConfig = require(ConfigPath:WaitForChild("MonsterConfig"))
-local HeroConfig = require(ConfigPath:WaitForChild("HeroConfig"))
-local RoomConfig = require(ConfigPath:WaitForChild("RoomConfig"))
-
-local DataTemplate = require(ModulesPath:WaitForChild("DataTemplate"))
-local CurrencyUtil = require(ModulesPath:WaitForChild("CurrencyUtil"))
-local SignalUtil = require(ModulesPath:WaitForChild("SignalUtil"))
-local RemoteIndex = require(RemotesPath:WaitForChild("RemoteIndex"))
-
-print("[ServerMain] Shared Modules geladen!")
-
--------------------------------------------------
--- REMOTES ERSTELLEN
--------------------------------------------------
-print("[ServerMain] Erstelle Remotes...")
-RemoteIndex.Setup()
-print("[ServerMain] Remotes erstellt!")
-
--------------------------------------------------
--- CORE MODULES LADEN
--------------------------------------------------
-print("[ServerMain] Lade Core Modules...")
-
-local DataManager = require(CorePath:WaitForChild("DataManager"))
-local PlayerManager = require(CorePath:WaitForChild("PlayerManager"))
-local GameLoop = require(CorePath:WaitForChild("GameLoop"))
-
-print("[ServerMain] Core Modules geladen!")
-
--------------------------------------------------
--- SERVICES LADEN
--------------------------------------------------
-print("[ServerMain] Lade Services...")
-
-local CurrencyService = require(ServicesPath:WaitForChild("CurrencyService"))
-local ShopService = require(ServicesPath:WaitForChild("ShopService"))
-
-print("[ServerMain] Services geladen!")
-
--------------------------------------------------
--- SYSTEMS LADEN
--------------------------------------------------
-print("[ServerMain] Lade Systems...")
-
-local DungeonSystem = require(SystemsPath:WaitForChild("DungeonSystem"))
-local RaidSystem = require(SystemsPath:WaitForChild("RaidSystem"))
-local HeroSystem = require(SystemsPath:WaitForChild("HeroSystem"))
-
-print("[ServerMain] Systems geladen!")
-
--------------------------------------------------
--- INITIALISIERUNG (Reihenfolge wichtig!)
--------------------------------------------------
-print("[ServerMain] Initialisiere Module...")
-
--- 1. DataManager zuerst (keine Abhängigkeiten)
-DataManager.Initialize()
-
--- 2. PlayerManager (braucht DataManager)
-PlayerManager.Initialize(DataManager)
-
--- 3. CurrencyService (braucht DataManager, PlayerManager)
-CurrencyService.Initialize(DataManager, PlayerManager)
-
--- 4. ShopService (braucht DataManager, PlayerManager, CurrencyService)
-ShopService.Initialize(DataManager, PlayerManager, CurrencyService)
-
--- 5. DungeonSystem (braucht DataManager, PlayerManager, CurrencyService)
-DungeonSystem.Initialize(DataManager, PlayerManager, CurrencyService)
-
--- 6. HeroSystem (braucht DataManager, PlayerManager, CurrencyService)
-HeroSystem.Initialize(DataManager, PlayerManager, CurrencyService)
-
--- 7. RaidSystem (braucht DataManager, PlayerManager, CurrencyService, DungeonSystem)
-RaidSystem.Initialize(DataManager, PlayerManager, CurrencyService, DungeonSystem)
-
--- 8. GameLoop (braucht DataManager, PlayerManager)
-GameLoop.Initialize(DataManager, PlayerManager)
-
-print("[ServerMain] Module initialisiert!")
-
--------------------------------------------------
--- REMOTE HANDLER VERBINDEN
--------------------------------------------------
-print("[ServerMain] Verbinde Remote Handler...")
-
---[[
-    =============================================
-    WÄHRUNG & ECONOMY
-    =============================================
-]]
-
--- Currency_Request: Client fragt aktuelle Währung ab
-RemoteIndex.Get("Currency_Request").OnServerInvoke = function(player)
-    local data = DataManager.GetData(player)
-    if not data then
-        return { Success = false, Error = "Daten nicht geladen" }
+local function log(category, message)
+    if DEBUG_MODE then
+        print(string.format("[%s] %s", category, message))
     end
-    
-    return {
-        Success = true,
-        Gold = data.Currency.Gold,
-        Gems = data.Currency.Gems,
-    }
 end
 
--- Currency_CollectPassive: Passives Einkommen abholen
-RemoteIndex.Get("Currency_CollectPassive").OnServerInvoke = function(player)
-    local data = DataManager.GetData(player)
-    if not data then
-        return { Success = false, Error = "Daten nicht geladen" }
-    end
+local function logError(category, message)
+    warn(string.format("[%s] ERROR: %s", category, message))
+end
+
+local function logSuccess(message)
+    print("✅ " .. message)
+end
+
+-------------------------------------------------
+-- MODUL-REFERENZEN
+-------------------------------------------------
+local Modules = {
+    -- Config
+    GameConfig = nil,
+    TrapConfig = nil,
+    MonsterConfig = nil,
+    HeroConfig = nil,
+    RoomConfig = nil,
     
-    local currentTime = os.time()
-    local lastCollect = data.Cooldowns.LastPassiveCollect or currentTime
-    local dungeonLevel = data.Dungeon.Level or 1
-    local prestigeLevel = data.Prestige.Level or 0
+    -- Shared Utilities
+    DataTemplate = nil,
+    CurrencyUtil = nil,
+    SignalUtil = nil,
+    RemoteIndex = nil,
     
-    -- Angesammeltes Einkommen berechnen
-    local accumulated = CurrencyUtil.CalculateAccumulatedIncome(
-        dungeonLevel,
-        prestigeLevel,
-        lastCollect,
-        currentTime
-    )
+    -- Core
+    DataManager = nil,
+    PlayerManager = nil,
+    GameLoop = nil,
     
-    if accumulated <= 0 then
-        return { Success = false, Error = "Nichts zum Abholen" }
-    end
+    -- Services
+    CurrencyService = nil,
+    ShopService = nil,
     
-    -- Gold hinzufügen über CurrencyService
-    local success, actualAmount = CurrencyService.AddGold(
-        player,
-        accumulated,
-        CurrencyService.TransactionType.PassiveIncome,
-        "PassiveCollect"
-    )
+    -- Systems
+    DungeonSystem = nil,
+    RaidSystem = nil,
+    HeroSystem = nil,
+    CombatSystem = nil,
+    RewardSystem = nil,
+}
+
+-------------------------------------------------
+-- SAFE REQUIRE
+-------------------------------------------------
+local function safeRequire(moduleInstance, moduleName)
+    local success, result = pcall(function()
+        return require(moduleInstance)
+    end)
     
     if success then
-        DataManager.SetValue(player, "Cooldowns.LastPassiveCollect", currentTime)
+        log("Loader", "Geladen: " .. moduleName)
+        return result
+    else
+        logError("Loader", "Fehler beim Laden von " .. moduleName .. ": " .. tostring(result))
+        return nil
+    end
+end
+
+-------------------------------------------------
+-- PHASE 1: SHARED MODULES LADEN
+-------------------------------------------------
+local function loadSharedModules()
+    log("Phase 1", "Lade Shared Modules...")
+    
+    -- Configs
+    Modules.GameConfig = safeRequire(ConfigPath:WaitForChild("GameConfig"), "GameConfig")
+    Modules.TrapConfig = safeRequire(ConfigPath:WaitForChild("TrapConfig"), "TrapConfig")
+    Modules.MonsterConfig = safeRequire(ConfigPath:WaitForChild("MonsterConfig"), "MonsterConfig")
+    Modules.HeroConfig = safeRequire(ConfigPath:WaitForChild("HeroConfig"), "HeroConfig")
+    Modules.RoomConfig = safeRequire(ConfigPath:WaitForChild("RoomConfig"), "RoomConfig")
+    
+    -- Utilities
+    Modules.DataTemplate = safeRequire(ModulesPath:WaitForChild("DataTemplate"), "DataTemplate")
+    Modules.CurrencyUtil = safeRequire(ModulesPath:WaitForChild("CurrencyUtil"), "CurrencyUtil")
+    Modules.SignalUtil = safeRequire(ModulesPath:WaitForChild("SignalUtil"), "SignalUtil")
+    Modules.RemoteIndex = safeRequire(RemotesPath:WaitForChild("RemoteIndex"), "RemoteIndex")
+    
+    -- Validate critical modules
+    if not Modules.GameConfig or not Modules.RemoteIndex then
+        error("Kritische Shared Modules konnten nicht geladen werden!")
+    end
+    
+    logSuccess("Phase 1 abgeschlossen: Shared Modules geladen")
+end
+
+-------------------------------------------------
+-- PHASE 2: CORE MODULES LADEN
+-------------------------------------------------
+local function loadCoreModules()
+    log("Phase 2", "Lade Core Modules...")
+    
+    Modules.DataManager = safeRequire(CorePath:WaitForChild("DataManager"), "DataManager")
+    Modules.PlayerManager = safeRequire(CorePath:WaitForChild("PlayerManager"), "PlayerManager")
+    Modules.GameLoop = safeRequire(CorePath:WaitForChild("GameLoop"), "GameLoop")
+    
+    if not Modules.DataManager then
+        error("DataManager konnte nicht geladen werden!")
+    end
+    
+    logSuccess("Phase 2 abgeschlossen: Core Modules geladen")
+end
+
+-------------------------------------------------
+-- PHASE 3: SERVICES LADEN
+-------------------------------------------------
+local function loadServices()
+    log("Phase 3", "Lade Services...")
+    
+    Modules.CurrencyService = safeRequire(ServicesPath:WaitForChild("CurrencyService"), "CurrencyService")
+    Modules.ShopService = safeRequire(ServicesPath:WaitForChild("ShopService"), "ShopService")
+    
+    logSuccess("Phase 3 abgeschlossen: Services geladen")
+end
+
+-------------------------------------------------
+-- PHASE 4: SYSTEMS LADEN
+-------------------------------------------------
+local function loadSystems()
+    log("Phase 4", "Lade Systems...")
+    
+    Modules.DungeonSystem = safeRequire(SystemsPath:WaitForChild("DungeonSystem"), "DungeonSystem")
+    Modules.RaidSystem = safeRequire(SystemsPath:WaitForChild("RaidSystem"), "RaidSystem")
+    Modules.HeroSystem = safeRequire(SystemsPath:WaitForChild("HeroSystem"), "HeroSystem")
+    Modules.CombatSystem = safeRequire(SystemsPath:WaitForChild("CombatSystem"), "CombatSystem")
+    Modules.RewardSystem = safeRequire(SystemsPath:WaitForChild("RewardSystem"), "RewardSystem")
+    
+    logSuccess("Phase 4 abgeschlossen: Systems geladen")
+end
+
+-------------------------------------------------
+-- PHASE 5: INITIALISIERUNG
+-------------------------------------------------
+local function initializeModules()
+    log("Phase 5", "Initialisiere Module...")
+    
+    -- DataManager initialisieren (keine Dependencies)
+    if Modules.DataManager and Modules.DataManager.Initialize then
+        Modules.DataManager.Initialize()
+        log("Init", "DataManager initialisiert")
+    end
+    
+    -- PlayerManager initialisieren (braucht DataManager)
+    if Modules.PlayerManager and Modules.PlayerManager.Initialize then
+        Modules.PlayerManager.Initialize(Modules.DataManager)
+        log("Init", "PlayerManager initialisiert")
+    end
+    
+    -- CurrencyService initialisieren (braucht DataManager)
+    if Modules.CurrencyService and Modules.CurrencyService.Initialize then
+        Modules.CurrencyService.Initialize(Modules.DataManager)
+        log("Init", "CurrencyService initialisiert")
+    end
+    
+    -- ShopService initialisieren (braucht DataManager, CurrencyService)
+    if Modules.ShopService and Modules.ShopService.Initialize then
+        Modules.ShopService.Initialize(Modules.DataManager, Modules.CurrencyService)
+        log("Init", "ShopService initialisiert")
+    end
+    
+    -- DungeonSystem initialisieren (braucht DataManager, CurrencyService)
+    if Modules.DungeonSystem and Modules.DungeonSystem.Initialize then
+        Modules.DungeonSystem.Initialize(Modules.DataManager, Modules.CurrencyService)
+        log("Init", "DungeonSystem initialisiert")
+    end
+    
+    -- HeroSystem initialisieren (braucht DataManager, CurrencyService)
+    if Modules.HeroSystem and Modules.HeroSystem.Initialize then
+        Modules.HeroSystem.Initialize(Modules.DataManager, Modules.CurrencyService)
+        log("Init", "HeroSystem initialisiert")
+    end
+    
+    -- CombatSystem initialisieren (keine Dependencies)
+    if Modules.CombatSystem and Modules.CombatSystem.Initialize then
+        Modules.CombatSystem.Initialize()
+        log("Init", "CombatSystem initialisiert")
+    end
+    
+    -- RewardSystem initialisieren (braucht DataManager, PlayerManager, CurrencyService)
+    if Modules.RewardSystem and Modules.RewardSystem.Initialize then
+        Modules.RewardSystem.Initialize(
+            Modules.DataManager,
+            Modules.PlayerManager,
+            Modules.CurrencyService
+        )
+        log("Init", "RewardSystem initialisiert")
+    end
+    
+    -- RaidSystem initialisieren (braucht alles)
+    if Modules.RaidSystem and Modules.RaidSystem.Initialize then
+        Modules.RaidSystem.Initialize(
+            Modules.DataManager,
+            Modules.CurrencyService,
+            Modules.HeroSystem,
+            Modules.DungeonSystem,
+            Modules.CombatSystem,
+            Modules.RewardSystem
+        )
+        log("Init", "RaidSystem initialisiert")
+    end
+    
+    -- GameLoop initialisieren und starten (braucht DataManager, PlayerManager)
+    if Modules.GameLoop and Modules.GameLoop.Initialize then
+        Modules.GameLoop.Initialize(Modules.DataManager, Modules.PlayerManager)
+        Modules.GameLoop.Start()
+        log("Init", "GameLoop initialisiert und gestartet")
+    end
+    
+    logSuccess("Phase 5 abgeschlossen: Alle Module initialisiert")
+end
+
+-------------------------------------------------
+-- PHASE 6: REMOTE EVENTS VERBINDEN
+-------------------------------------------------
+local function setupRemoteEvents()
+    log("Phase 6", "Verbinde Remote Events...")
+    
+    local RemoteIndex = Modules.RemoteIndex
+    if not RemoteIndex then
+        logError("Remotes", "RemoteIndex nicht verfügbar!")
+        return
+    end
+    
+    -------------------------------------------
+    -- CURRENCY REMOTES
+    -------------------------------------------
+    
+    -- Currency anfragen
+    RemoteIndex.OnServerInvoke("Currency_Request", function(player)
+        if not Modules.CurrencyService then
+            return { Success = false, Error = "Service nicht verfügbar" }
+        end
+        
+        local gold = Modules.CurrencyService.GetGold(player)
+        local gems = Modules.CurrencyService.GetGems(player)
         
         return {
             Success = true,
-            Amount = actualAmount,
-            NewTotal = DataManager.GetValue(player, "Currency.Gold"),
+            Gold = gold,
+            Gems = gems,
         }
-    end
+    end)
     
-    return { Success = false, Error = "Gold-Limit erreicht" }
-end
-
---[[
-    =============================================
-    DUNGEON BUILDING
-    =============================================
-]]
-
--- Dungeon_AddRoom: Neuen Raum kaufen
-RemoteIndex.Get("Dungeon_AddRoom").OnServerInvoke = function(player, roomId)
-    local success, errorMsg, roomIndex = DungeonSystem.AddRoom(player, roomId)
+    -- Passives Einkommen abholen
+    RemoteIndex.OnServerInvoke("Currency_CollectPassive", function(player)
+        if not Modules.CurrencyService then
+            return { Success = false, Error = "Service nicht verfügbar" }
+        end
+        
+        local amount = Modules.CurrencyService.CollectPassiveIncome(player)
+        local newTotal = Modules.CurrencyService.GetGold(player)
+        
+        return {
+            Success = amount > 0,
+            Amount = amount,
+            NewTotal = newTotal,
+        }
+    end)
     
-    if success then
+    -------------------------------------------
+    -- SHOP REMOTES
+    -------------------------------------------
+    
+    -- Unlocked Items anfragen
+    RemoteIndex.OnServerInvoke("Shop_GetUnlocked", function(player)
+        if not Modules.ShopService then
+            return { Success = false, Error = "Service nicht verfügbar" }
+        end
+        
+        local unlocked = Modules.ShopService.GetUnlockedItems(player)
+        
         return {
             Success = true,
-            RoomIndex = roomIndex,
+            Unlocked = unlocked,
         }
-    else
-        return { Success = false, Error = errorMsg }
-    end
-end
-
--- Dungeon_UpgradeRoom: Raum upgraden
-RemoteIndex.Get("Dungeon_UpgradeRoom").OnServerInvoke = function(player, roomIndex)
-    local success, errorMsg, newLevel, cost = ShopService.UpgradeRoom(player, roomIndex)
+    end)
     
-    if success then
+    -- Item freischalten
+    RemoteIndex.OnServerInvoke("Shop_Unlock", function(player, category, itemId)
+        if not Modules.ShopService then
+            return { Success = false, Error = "Service nicht verfügbar" }
+        end
+        
+        local success, error = Modules.ShopService.UnlockItem(player, category, itemId)
+        
+        if success then
+            return {
+                Success = true,
+                NewGold = Modules.CurrencyService.GetGold(player),
+                NewGems = Modules.CurrencyService.GetGems(player),
+            }
+        else
+            return { Success = false, Error = error }
+        end
+    end)
+    
+    -------------------------------------------
+    -- DUNGEON REMOTES
+    -------------------------------------------
+    
+    -- Dungeon-Daten anfragen
+    RemoteIndex.OnServerInvoke("Dungeon_GetData", function(player)
+        if not Modules.DungeonSystem then
+            return { Success = false, Error = "System nicht verfügbar" }
+        end
+        
+        local dungeonData = Modules.DungeonSystem.GetDungeonData(player)
+        
         return {
             Success = true,
-            NewLevel = newLevel,
-            Cost = cost,
+            Dungeon = dungeonData,
         }
-    else
-        return { Success = false, Error = errorMsg }
-    end
-end
-
--- Dungeon_PlaceTrap: Falle platzieren
-RemoteIndex.Get("Dungeon_PlaceTrap").OnServerInvoke = function(player, roomIndex, slotIndex, trapId)
-    local success, errorMsg = DungeonSystem.PlaceTrap(player, roomIndex, slotIndex, trapId)
+    end)
     
-    if success then
-        return { Success = true }
-    else
-        return { Success = false, Error = errorMsg }
-    end
-end
-
--- Dungeon_RemoveTrap: Falle entfernen
-RemoteIndex.Get("Dungeon_RemoveTrap").OnServerInvoke = function(player, roomIndex, slotIndex)
-    local success, errorMsg = DungeonSystem.RemoveTrap(player, roomIndex, slotIndex)
+    -- Raum hinzufügen
+    RemoteIndex.OnServerInvoke("Dungeon_AddRoom", function(player, roomId)
+        if not Modules.DungeonSystem then
+            return { Success = false, Error = "System nicht verfügbar" }
+        end
+        
+        local success, error = Modules.DungeonSystem.AddRoom(player, roomId)
+        
+        return {
+            Success = success,
+            Error = error,
+        }
+    end)
     
-    if success then
-        return { Success = true }
-    else
-        return { Success = false, Error = errorMsg }
-    end
-end
-
--- Dungeon_PlaceMonster: Monster platzieren
-RemoteIndex.Get("Dungeon_PlaceMonster").OnServerInvoke = function(player, roomIndex, slotIndex, monsterId)
-    local success, errorMsg = DungeonSystem.PlaceMonster(player, roomIndex, slotIndex, monsterId)
+    -- Falle platzieren
+    RemoteIndex.OnServerInvoke("Dungeon_PlaceTrap", function(player, roomIndex, slotIndex, trapId)
+        if not Modules.DungeonSystem then
+            return { Success = false, Error = "System nicht verfügbar" }
+        end
+        
+        local success, error = Modules.DungeonSystem.PlaceTrap(player, roomIndex, slotIndex, trapId)
+        
+        return {
+            Success = success,
+            Error = error,
+        }
+    end)
     
-    if success then
-        return { Success = true }
-    else
-        return { Success = false, Error = errorMsg }
-    end
-end
-
--- Dungeon_RemoveMonster: Monster entfernen
-RemoteIndex.Get("Dungeon_RemoveMonster").OnServerInvoke = function(player, roomIndex, slotIndex)
-    local success, errorMsg = DungeonSystem.RemoveMonster(player, roomIndex, slotIndex)
+    -- Monster platzieren
+    RemoteIndex.OnServerInvoke("Dungeon_PlaceMonster", function(player, roomIndex, slotIndex, monsterId)
+        if not Modules.DungeonSystem then
+            return { Success = false, Error = "System nicht verfügbar" }
+        end
+        
+        local success, error = Modules.DungeonSystem.PlaceMonster(player, roomIndex, slotIndex, monsterId)
+        
+        return {
+            Success = success,
+            Error = error,
+        }
+    end)
     
-    if success then
-        return { Success = true }
-    else
-        return { Success = false, Error = errorMsg }
-    end
-end
-
--- Dungeon_Rename: Dungeon umbenennen
-RemoteIndex.Get("Dungeon_Rename").OnServerInvoke = function(player, newName)
-    local success, errorMsg, sanitizedName = DungeonSystem.RenameDungeon(player, newName)
+    -------------------------------------------
+    -- HERO REMOTES
+    -------------------------------------------
     
-    if success then
-        return { Success = true, Name = sanitizedName }
-    else
-        return { Success = false, Error = errorMsg }
-    end
-end
-
---[[
-    =============================================
-    SHOP & UNLOCKS
-    =============================================
-]]
-
--- Shop_UnlockTrap: Falle freischalten
-RemoteIndex.Get("Shop_UnlockTrap").OnServerInvoke = function(player, trapId)
-    local success, errorMsg, cost = ShopService.UnlockTrap(player, trapId)
-    
-    if success then
-        return { Success = true, Cost = cost }
-    else
-        return { Success = false, Error = errorMsg }
-    end
-end
-
--- Shop_UnlockMonster: Monster freischalten
-RemoteIndex.Get("Shop_UnlockMonster").OnServerInvoke = function(player, monsterId)
-    local success, errorMsg, cost = ShopService.UnlockMonster(player, monsterId)
-    
-    if success then
-        return { Success = true, Cost = cost }
-    else
-        return { Success = false, Error = errorMsg }
-    end
-end
-
--- Shop_UnlockRoom: Raum-Typ freischalten
-RemoteIndex.Get("Shop_UnlockRoom").OnServerInvoke = function(player, roomId)
-    local success, errorMsg, cost = ShopService.UnlockRoom(player, roomId)
-    
-    if success then
-        return { Success = true, Cost = cost }
-    else
-        return { Success = false, Error = errorMsg }
-    end
-end
-
--- Shop_UnlockHero: Held freischalten
-RemoteIndex.Get("Shop_UnlockHero").OnServerInvoke = function(player, heroId)
-    local success, errorMsg, cost = ShopService.UnlockHero(player, heroId)
-    
-    if success then
-        return { Success = true, Cost = cost }
-    else
-        return { Success = false, Error = errorMsg }
-    end
-end
-
---[[
-    =============================================
-    HELDEN-MANAGEMENT
-    =============================================
-]]
-
--- Heroes_Recruit: Held rekrutieren
-RemoteIndex.Get("Heroes_Recruit").OnServerInvoke = function(player, heroId)
-    local success, result = HeroSystem.RecruitHero(player, heroId)
-    
-    if success then
+    -- Alle Helden anfragen
+    RemoteIndex.OnServerInvoke("Hero_GetAll", function(player)
+        if not Modules.HeroSystem then
+            return { Success = false, Error = "System nicht verfügbar" }
+        end
+        
+        local heroes = Modules.HeroSystem.GetAllHeroes(player)
+        local team = Modules.HeroSystem.GetTeam(player)
+        
         return {
             Success = true,
-            HeroInstanceId = result.InstanceId,
-            Hero = result.Hero,
-            Rarity = result.Rarity,
-            RarityName = result.RarityName,
+            Heroes = heroes,
+            Team = team,
         }
-    else
-        return { Success = false, Error = result }
-    end
-end
-
--- Heroes_SetTeam: Raid-Team setzen
-RemoteIndex.Get("Heroes_SetTeam").OnServerInvoke = function(player, teamIds)
-    local success, errorMsg, synergies = HeroSystem.SetTeam(player, teamIds)
+    end)
     
-    if success then
+    -- Held rekrutieren
+    RemoteIndex.OnServerInvoke("Hero_Recruit", function(player, currency)
+        if not Modules.HeroSystem then
+            return { Success = false, Error = "System nicht verfügbar" }
+        end
+        
+        local hero, error = Modules.HeroSystem.RecruitHero(player, currency)
+        
+        if hero then
+            return {
+                Success = true,
+                Hero = hero,
+            }
+        else
+            return { Success = false, Error = error }
+        end
+    end)
+    
+    -- Held ins Team
+    RemoteIndex.OnServerInvoke("Hero_AddToTeam", function(player, instanceId)
+        if not Modules.HeroSystem then
+            return { Success = false, Error = "System nicht verfügbar" }
+        end
+        
+        local success, error = Modules.HeroSystem.AddToTeam(player, instanceId)
+        
+        return {
+            Success = success,
+            Error = error,
+        }
+    end)
+    
+    -- Held aus Team entfernen
+    RemoteIndex.OnServerInvoke("Hero_RemoveFromTeam", function(player, instanceId)
+        if not Modules.HeroSystem then
+            return { Success = false, Error = "System nicht verfügbar" }
+        end
+        
+        local success, error = Modules.HeroSystem.RemoveFromTeam(player, instanceId)
+        
+        return {
+            Success = success,
+            Error = error,
+        }
+    end)
+    
+    -- Held entlassen
+    RemoteIndex.OnServerInvoke("Hero_Dismiss", function(player, instanceId)
+        if not Modules.HeroSystem then
+            return { Success = false, Error = "System nicht verfügbar" }
+        end
+        
+        local success, error = Modules.HeroSystem.DismissHero(player, instanceId)
+        
+        return {
+            Success = success,
+            Error = error,
+        }
+    end)
+    
+    -------------------------------------------
+    -- RAID REMOTES
+    -------------------------------------------
+    
+    -- Raid-Status anfragen
+    RemoteIndex.OnServerInvoke("Raid_GetStatus", function(player)
+        if not Modules.RaidSystem then
+            return { Success = false, Error = "System nicht verfügbar" }
+        end
+        
+        local canRaid, cooldown = Modules.RaidSystem.CanStartRaid(player)
+        local team = Modules.HeroSystem and Modules.HeroSystem.GetTeamData(player) or {}
+        
         return {
             Success = true,
-            Synergies = synergies,
+            CanRaid = canRaid,
+            Cooldown = cooldown,
+            Team = team,
         }
-    else
-        return { Success = false, Error = errorMsg }
-    end
-end
-
--- Heroes_Upgrade: Held upgraden (XP hinzufügen)
-RemoteIndex.Get("Heroes_Upgrade").OnServerInvoke = function(player, heroInstanceId, xpAmount)
-    -- XP durch Items/Käufe - hier Beispiel mit fixen Kosten
-    local data = DataManager.GetData(player)
-    if not data then
-        return { Success = false, Error = "Daten nicht geladen" }
-    end
+    end)
     
-    -- Kosten: 100 Gold pro 10 XP
-    local cost = { Gold = math.floor(xpAmount * 10), Gems = 0 }
+    -- Gegner suchen
+    RemoteIndex.OnServerInvoke("Raid_FindTarget", function(player)
+        if not Modules.RaidSystem then
+            return { Success = false, Error = "System nicht verfügbar" }
+        end
+        
+        local target, error = Modules.RaidSystem.FindTarget(player)
+        
+        if target then
+            return {
+                Success = true,
+                Target = target,
+            }
+        else
+            return { Success = false, Error = error }
+        end
+    end)
     
-    local purchaseSuccess, purchaseError = CurrencyService.Purchase(
-        player,
-        cost,
-        CurrencyService.TransactionType.Upgrade,
-        "HeroXP:" .. heroInstanceId
-    )
+    -- Raid starten
+    RemoteIndex.OnServerInvoke("Raid_Start", function(player, targetId)
+        if not Modules.RaidSystem then
+            return { Success = false, Error = "System nicht verfügbar" }
+        end
+        
+        local raidId, totalRooms, error = Modules.RaidSystem.StartRaid(player, targetId)
+        
+        if raidId then
+            return {
+                Success = true,
+                RaidId = raidId,
+                TotalRooms = totalRooms,
+            }
+        else
+            return { Success = false, Error = error }
+        end
+    end)
     
-    if not purchaseSuccess then
-        return { Success = false, Error = purchaseError }
-    end
+    -- Raid fliehen
+    RemoteIndex.OnServerInvoke("Raid_Flee", function(player, raidId)
+        if not Modules.RaidSystem then
+            return { Success = false, Error = "System nicht verfügbar" }
+        end
+        
+        local result = Modules.RaidSystem.FleeRaid(player, raidId)
+        
+        return result
+    end)
     
-    local success, newLevel, leveledUp = HeroSystem.AddHeroXP(player, heroInstanceId, xpAmount)
+    -------------------------------------------
+    -- PRESTIGE REMOTES
+    -------------------------------------------
     
-    if success then
+    -- Prestige-Status anfragen
+    RemoteIndex.OnServerInvoke("Prestige_GetStatus", function(player)
+        local data = Modules.DataManager and Modules.DataManager.GetData(player)
+        if not data then
+            return { Success = false, Error = "Daten nicht verfügbar" }
+        end
+        
+        local prestigeLevel = data.Prestige.Level or 0
+        local dungeonLevel = data.Dungeon.Level or 1
+        local minLevel = Modules.GameConfig.Prestige.MinLevel or 25
+        
         return {
             Success = true,
-            NewLevel = newLevel,
-            LeveledUp = leveledUp,
+            PrestigeLevel = prestigeLevel,
+            DungeonLevel = dungeonLevel,
+            CanPrestige = dungeonLevel >= minLevel,
+            TotalBonus = prestigeLevel * (Modules.GameConfig.Prestige.BonusPerPrestige or 0.05) * 100,
         }
-    else
-        return { Success = false, Error = "Held nicht gefunden" }
-    end
-end
-
--- Heroes_Dismiss: Held entlassen
-RemoteIndex.Get("Heroes_Dismiss").OnServerInvoke = function(player, heroInstanceId)
-    local success, errorMsg, refund = HeroSystem.DismissHero(player, heroInstanceId)
+    end)
     
-    if success then
+    -- Prestige ausführen
+    RemoteIndex.OnServerInvoke("Prestige_Execute", function(player)
+        local data = Modules.DataManager and Modules.DataManager.GetData(player)
+        if not data then
+            return { Success = false, Error = "Daten nicht verfügbar" }
+        end
+        
+        local dungeonLevel = data.Dungeon.Level or 1
+        local minLevel = Modules.GameConfig.Prestige.MinLevel or 25
+        local maxPrestige = Modules.GameConfig.Prestige.MaxPrestige or 100
+        local currentPrestige = data.Prestige.Level or 0
+        
+        -- Prüfungen
+        if dungeonLevel < minLevel then
+            return { Success = false, Error = "Dungeon-Level zu niedrig" }
+        end
+        
+        if currentPrestige >= maxPrestige then
+            return { Success = false, Error = "Maximales Prestige erreicht" }
+        end
+        
+        -- Prestige ausführen
+        local newPrestigeLevel = currentPrestige + 1
+        
+        -- Prestige erhöhen
+        Modules.DataManager.SetValue(player, "Prestige.Level", newPrestigeLevel)
+        Modules.DataManager.SetValue(player, "Prestige.LastPrestigeAt", os.time())
+        
+        -- Dungeon zurücksetzen
+        Modules.DataManager.SetValue(player, "Dungeon.Level", 1)
+        Modules.DataManager.SetValue(player, "Dungeon.XP", 0)
+        Modules.DataManager.SetValue(player, "Dungeon.Rooms", {})
+        
+        -- Gold zurücksetzen (Gems behalten)
+        Modules.DataManager.SetValue(player, "Currency.Gold", Modules.GameConfig.Currency.StartGold or 100)
+        
+        -- Stats tracken
+        local totalPrestiges = (data.Progress.TotalPrestiges or 0) + 1
+        Modules.DataManager.SetValue(player, "Progress.TotalPrestiges", totalPrestiges)
+        
+        -- Achievement checken
+        if Modules.RewardSystem then
+            Modules.RewardSystem.CheckAchievementProgress(player, "PrestigeLevel", newPrestigeLevel)
+            Modules.RewardSystem.GrantLevelUpReward(player, 1) -- Starter-Bonus nach Prestige
+        end
+        
+        -- Client benachrichtigen
+        RemoteIndex.FireClient("Prestige_Update", player, {
+            PrestigeLevel = newPrestigeLevel,
+            DungeonLevel = 1,
+            CanPrestige = false,
+        })
+        
+        RemoteIndex.FireClient("Currency_Update", player, {
+            Gold = Modules.GameConfig.Currency.StartGold or 100,
+            Gems = data.Currency.Gems,
+        })
+        
         return {
             Success = true,
-            Refund = refund,
+            NewPrestigeLevel = newPrestigeLevel,
         }
-    else
-        return { Success = false, Error = errorMsg }
-    end
-end
-
---[[
-    =============================================
-    RAIDS
-    =============================================
-]]
-
--- Raid_FindTarget: Raid-Ziel suchen
-RemoteIndex.Get("Raid_FindTarget").OnServerInvoke = function(player)
-    -- Vorprüfung
-    local canRaid, reason = RaidSystem.CanRaid(player)
-    if not canRaid then
-        return { Success = false, Error = reason }
-    end
+    end)
     
-    local success, result = RaidSystem.FindTarget(player)
+    -------------------------------------------
+    -- PLAYER SETTINGS
+    -------------------------------------------
     
-    if success then
-        return {
-            Success = true,
-            IsNPC = result.IsNPC,
-            TargetName = result.TargetData.Dungeon.Name,
-            TargetLevel = result.TargetData.Dungeon.Level,
-            RoomCount = #result.TargetData.Dungeon.Rooms,
-            -- TargetData für StartRaid zwischenspeichern
-            TargetInfo = result,
+    RemoteIndex.OnServerInvoke("Player_SettingsUpdate", function(player, settingKey, value)
+        if not Modules.DataManager then
+            return { Success = false }
+        end
+        
+        -- Validiere Setting-Key
+        local validSettings = {
+            "MusicEnabled", "SFXEnabled", "NotificationsEnabled",
+            "AutoCollect", "ShowDamageNumbers"
         }
-    else
-        return { Success = false, Error = result }
-    end
-end
-
--- Raid_Start: Raid starten
-RemoteIndex.Get("Raid_Start").OnServerInvoke = function(player, targetInfo)
-    if not targetInfo then
-        return { Success = false, Error = "Kein Ziel ausgewählt" }
-    end
-    
-    local success, result = RaidSystem.StartRaid(player, targetInfo)
-    
-    if success then
-        return {
-            Success = true,
-            RaidId = result.RaidId,
-            TargetName = result.TargetName,
-            TotalRooms = result.TotalRooms,
-        }
-    else
-        return { Success = false, Error = result }
-    end
-end
-
---[[
-    =============================================
-    PRESTIGE
-    =============================================
-]]
-
--- Prestige_Info: Prestige-Info abfragen
-RemoteIndex.Get("Prestige_Info").OnServerInvoke = function(player)
-    local data = DataManager.GetData(player)
-    if not data then
-        return { Success = false, Error = "Daten nicht geladen" }
-    end
-    
-    local currentLevel = data.Prestige.Level or 0
-    local dungeonLevel = data.Dungeon.Level or 1
-    local requiredLevel = GameConfig.Prestige.RequiredDungeonLevel
-    local canPrestige = dungeonLevel >= requiredLevel
-    
-    local nextBonus = (currentLevel + 1) * GameConfig.Prestige.BonusPerPrestige
-    local totalBonus = currentLevel * GameConfig.Prestige.BonusPerPrestige
-    
-    return {
-        Success = true,
-        CurrentLevel = currentLevel,
-        TotalBonus = totalBonus,
-        NextBonus = nextBonus,
-        CanPrestige = canPrestige,
-        RequiredDungeonLevel = requiredLevel,
-        CurrentDungeonLevel = dungeonLevel,
-    }
-end
-
--- Prestige_Execute: Prestige durchführen
-RemoteIndex.Get("Prestige_Execute").OnServerInvoke = function(player)
-    local data = DataManager.GetData(player)
-    if not data then
-        return { Success = false, Error = "Daten nicht geladen" }
-    end
-    
-    local dungeonLevel = data.Dungeon.Level or 1
-    local requiredLevel = GameConfig.Prestige.RequiredDungeonLevel
-    
-    if dungeonLevel < requiredLevel then
-        return { Success = false, Error = "Dungeon-Level " .. requiredLevel .. " benötigt" }
-    end
-    
-    local maxPrestige = GameConfig.Prestige.MaxPrestige
-    local currentPrestige = data.Prestige.Level or 0
-    
-    if currentPrestige >= maxPrestige then
-        return { Success = false, Error = "Maximales Prestige erreicht" }
-    end
-    
-    -- Prestige durchführen
-    local newPrestigeLevel = currentPrestige + 1
-    local newBonus = newPrestigeLevel * GameConfig.Prestige.BonusPerPrestige
-    
-    -- Prestige-Daten setzen
-    DataManager.SetValue(player, "Prestige.Level", newPrestigeLevel)
-    DataManager.SetValue(player, "Prestige.TotalBonusPercent", newBonus)
-    
-    -- Dungeon zurücksetzen (aber Freischaltungen behalten)
-    DataManager.SetValue(player, "Dungeon.Level", 1)
-    DataManager.SetValue(player, "Dungeon.Experience", 0)
-    
-    -- Starter-Räume zurücksetzen
-    local starterRooms = {
-        [1] = { RoomId = "stone_corridor", Level = 1, Traps = {}, Monsters = {} },
-        [2] = { RoomId = "stone_corridor", Level = 1, Traps = {}, Monsters = {} },
-        [3] = { RoomId = "guard_chamber", Level = 1, Traps = {}, Monsters = {} },
-    }
-    DataManager.SetValue(player, "Dungeon.Rooms", starterRooms)
-    
-    -- Währung zurücksetzen auf Startwerte
-    DataManager.SetValue(player, "Currency.Gold", GameConfig.Currency.StartingGold)
-    DataManager.SetValue(player, "Currency.Gems", GameConfig.Currency.StartingGems)
-    
-    -- Helden behalten, aber Team leeren
-    DataManager.SetValue(player, "Heroes.Team", {})
-    
-    -- Client über Änderungen informieren
-    RemoteIndex.FireClient("Currency_Update", player, {
-        Gold = GameConfig.Currency.StartingGold,
-        Gems = GameConfig.Currency.StartingGems,
-        Source = "Prestige",
-    })
-    
-    RemoteIndex.FireClient("Dungeon_Update", player, {
-        Level = 1,
-        Experience = 0,
-        Rooms = starterRooms,
-    })
-    
-    RemoteIndex.FireClient("Heroes_Update", player, {
-        Owned = data.Heroes.Owned,
-        Team = {},
-        Unlocked = data.Heroes.Unlocked,
-    })
-    
-    -- Benachrichtigung
-    PlayerManager.SendNotification(
-        player,
-        "Prestige " .. newPrestigeLevel .. "!",
-        "+" .. math.floor(newBonus * 100) .. "% Bonus auf alles!",
-        "Success"
-    )
-    
-    return {
-        Success = true,
-        NewPrestigeLevel = newPrestigeLevel,
-        TotalBonus = newBonus,
-    }
-end
-
---[[
-    =============================================
-    SPIELER-EINSTELLUNGEN
-    =============================================
-]]
-
--- Player_SettingsUpdate: Einstellungen ändern
-RemoteIndex.Get("Player_SettingsUpdate").OnServerInvoke = function(player, settingKey, value)
-    local data = DataManager.GetData(player)
-    if not data then
-        return { Success = false, Error = "Daten nicht geladen" }
-    end
-    
-    -- Erlaubte Settings
-    local allowedSettings = {
-        MusicEnabled = "boolean",
-        SFXEnabled = "boolean",
-        NotificationsEnabled = "boolean",
-        Language = "string",
-    }
-    
-    if not allowedSettings[settingKey] then
-        return { Success = false, Error = "Ungültige Einstellung" }
-    end
-    
-    if type(value) ~= allowedSettings[settingKey] then
-        return { Success = false, Error = "Ungültiger Wert-Typ" }
-    end
-    
-    -- Sprache validieren
-    if settingKey == "Language" then
-        local validLanguages = { "de", "en", "es", "fr" }
+        
         local isValid = false
-        for _, lang in ipairs(validLanguages) do
-            if value == lang then
+        for _, valid in ipairs(validSettings) do
+            if settingKey == valid then
                 isValid = true
                 break
             end
         end
+        
         if not isValid then
-            return { Success = false, Error = "Ungültige Sprache" }
+            return { Success = false, Error = "Ungültige Einstellung" }
         end
-    end
+        
+        Modules.DataManager.SetValue(player, "Settings." .. settingKey, value)
+        
+        return { Success = true }
+    end)
     
-    DataManager.SetValue(player, "Settings." .. settingKey, value)
-    
-    return { Success = true }
+    logSuccess("Phase 6 abgeschlossen: Remote Events verbunden")
 end
 
---[[
-    =============================================
-    TUTORIAL & ACHIEVEMENTS
-    =============================================
-]]
-
--- Tutorial_Complete: Tutorial-Schritt abschließen
-RemoteIndex.Get("Tutorial_Complete").OnServerInvoke = function(player, stepName)
-    local data = DataManager.GetData(player)
-    if not data then
-        return { Success = false, Error = "Daten nicht geladen" }
-    end
+-------------------------------------------------
+-- PHASE 7: PLAYER HANDLING
+-------------------------------------------------
+local function setupPlayerHandling()
+    log("Phase 7", "Richte Player-Handling ein...")
     
-    -- Gültige Schritte
-    local validSteps = { "Intro", "FirstRoom", "FirstTrap", "FirstMonster", "FirstRaid", "FirstDefense" }
-    local isValid = false
-    
-    for _, step in ipairs(validSteps) do
-        if step == stepName then
-            isValid = true
-            break
-        end
-    end
-    
-    if not isValid then
-        return { Success = false, Error = "Ungültiger Tutorial-Schritt" }
-    end
-    
-    -- Bereits abgeschlossen?
-    if data.Progress.Tutorial[stepName] then
-        return { Success = false, Error = "Bereits abgeschlossen" }
-    end
-    
-    DataManager.SetValue(player, "Progress.Tutorial." .. stepName, true)
-    
-    -- Belohnung je nach Schritt
-    local rewards = {
-        Intro = { Gold = 100, Gems = 0 },
-        FirstRoom = { Gold = 200, Gems = 0 },
-        FirstTrap = { Gold = 150, Gems = 0 },
-        FirstMonster = { Gold = 150, Gems = 0 },
-        FirstRaid = { Gold = 500, Gems = 5 },
-        FirstDefense = { Gold = 300, Gems = 3 },
-    }
-    
-    local reward = rewards[stepName]
-    if reward then
-        CurrencyService.GiveReward(
-            player,
-            reward,
-            CurrencyService.TransactionType.AchievementReward,
-            "Tutorial:" .. stepName
-        )
-    end
-    
-    return {
-        Success = true,
-        Reward = reward,
-    }
-end
-
---[[
-    =============================================
-    INBOX & REWARDS
-    =============================================
-]]
-
--- Inbox_Claim: Belohnung abholen
-RemoteIndex.Get("Inbox_Claim").OnServerInvoke = function(player, rewardId)
-    local data = DataManager.GetData(player)
-    if not data then
-        return { Success = false, Error = "Daten nicht geladen" }
-    end
-    
-    -- Belohnung finden
-    local inbox = data.Inbox or {}
-    local rewardIndex = nil
-    local reward = nil
-    
-    for i, item in ipairs(inbox) do
-        if item.Id == rewardId then
-            rewardIndex = i
-            reward = item
-            break
-        end
-    end
-    
-    if not reward then
-        return { Success = false, Error = "Belohnung nicht gefunden" }
-    end
-    
-    if reward.Claimed then
-        return { Success = false, Error = "Bereits abgeholt" }
-    end
-    
-    -- Abgelaufen?
-    if reward.ExpiresAt and os.time() > reward.ExpiresAt then
-        return { Success = false, Error = "Belohnung abgelaufen" }
-    end
-    
-    -- Belohnung geben
-    local actualReward = CurrencyService.GiveReward(
-        player,
-        reward.Rewards or {},
-        CurrencyService.TransactionType.AchievementReward,
-        "Inbox:" .. rewardId
-    )
-    
-    -- Als abgeholt markieren oder entfernen
-    table.remove(inbox, rewardIndex)
-    DataManager.SetValue(player, "Inbox", inbox)
-    
-    -- Client updaten
-    RemoteIndex.FireClient("Inbox_Update", player, inbox)
-    
-    return {
-        Success = true,
-        Reward = actualReward,
-    }
-end
-
--- Inbox_ClaimAll: Alle abholen
-RemoteIndex.Get("Inbox_ClaimAll").OnServerInvoke = function(player)
-    local data = DataManager.GetData(player)
-    if not data then
-        return { Success = false, Error = "Daten nicht geladen" }
-    end
-    
-    local inbox = data.Inbox or {}
-    local totalReward = { Gold = 0, Gems = 0 }
-    local claimedCount = 0
-    local newInbox = {}
-    
-    for _, item in ipairs(inbox) do
-        local canClaim = not item.Claimed
-        
-        -- Abgelaufen?
-        if item.ExpiresAt and os.time() > item.ExpiresAt then
-            canClaim = false
-        end
-        
-        if canClaim and item.Rewards then
-            -- Belohnung geben
-            local actualReward = CurrencyService.GiveReward(
-                player,
-                item.Rewards,
-                CurrencyService.TransactionType.AchievementReward,
-                "Inbox:" .. item.Id
-            )
-            
-            totalReward.Gold = totalReward.Gold + (actualReward.Gold or 0)
-            totalReward.Gems = totalReward.Gems + (actualReward.Gems or 0)
-            claimedCount = claimedCount + 1
-        else
-            -- Nicht abholbar, behalten
-            table.insert(newInbox, item)
-        end
-    end
-    
-    DataManager.SetValue(player, "Inbox", newInbox)
-    
-    -- Client updaten
-    RemoteIndex.FireClient("Inbox_Update", player, newInbox)
-    
-    return {
-        Success = true,
-        ClaimedCount = claimedCount,
-        TotalReward = totalReward,
-    }
-end
-
---[[
-    =============================================
-    DEBUG (Nur im Debug-Modus)
-    =============================================
-]]
-
--- Debug_Command: Debug-Befehle
-RemoteIndex.Get("Debug_Command").OnServerInvoke = function(player, command, ...)
-    if not GameConfig.Debug.Enabled then
-        return { Success = false, Error = "Debug-Modus nicht aktiviert" }
-    end
-    
-    local args = {...}
-    
-    if command == "AddGold" then
-        local amount = args[1] or 1000
-        CurrencyService.AddGold(player, amount, CurrencyService.TransactionType.AdminGrant, "Debug")
-        return { Success = true, Message = "+" .. amount .. " Gold" }
-        
-    elseif command == "AddGems" then
-        local amount = args[1] or 100
-        CurrencyService.AddGems(player, amount, CurrencyService.TransactionType.AdminGrant, "Debug")
-        return { Success = true, Message = "+" .. amount .. " Gems" }
-        
-    elseif command == "SetLevel" then
-        local level = args[1] or 10
-        DataManager.SetValue(player, "Dungeon.Level", level)
-        RemoteIndex.FireClient("Dungeon_Update", player, { Level = level })
-        return { Success = true, Message = "Level = " .. level }
-        
-    elseif command == "ResetData" then
-        DataManager.ResetData(player)
-        return { Success = true, Message = "Daten zurückgesetzt" }
-        
-    elseif command == "UnlockAll" then
-        local data = DataManager.GetData(player)
-        if data then
-            -- Alle Fallen freischalten
-            for trapId, _ in pairs(TrapConfig.Traps) do
-                data.Dungeon.UnlockedTraps[trapId] = true
+    -- Bereits verbundene Spieler verarbeiten
+    for _, player in ipairs(Players:GetPlayers()) do
+        task.spawn(function()
+            if Modules.DataManager then
+                Modules.DataManager.LoadPlayerData(player)
             end
-            DataManager.SetValue(player, "Dungeon.UnlockedTraps", data.Dungeon.UnlockedTraps)
+        end)
+    end
+    
+    -- PlayerAdded wird bereits vom DataManager/PlayerManager gehandelt
+    -- Hier nur zusätzliche Logik falls nötig
+    
+    Players.PlayerAdded:Connect(function(player)
+        log("Player", player.Name .. " ist beigetreten")
+    end)
+    
+    Players.PlayerRemoving:Connect(function(player)
+        log("Player", player.Name .. " hat verlassen")
+    end)
+    
+    logSuccess("Phase 7 abgeschlossen: Player-Handling eingerichtet")
+end
+
+-------------------------------------------------
+-- PHASE 8: SIGNAL VERBINDUNGEN
+-------------------------------------------------
+local function setupSignalConnections()
+    log("Phase 8", "Verbinde Signals...")
+    
+    -- PlayerManager Signals
+    if Modules.PlayerManager and Modules.PlayerManager.Signals then
+        Modules.PlayerManager.Signals.PlayerReady:Connect(function(player)
+            log("Signal", player.Name .. " ist bereit")
             
-            -- Alle Monster freischalten
-            for monsterId, config in pairs(MonsterConfig.Monsters) do
-                if config.Purchasable ~= false then
-                    data.Dungeon.UnlockedMonsters[monsterId] = true
-                end
+            -- Willkommens-Daten senden
+            if Modules.CurrencyService then
+                local gold = Modules.CurrencyService.GetGold(player)
+                local gems = Modules.CurrencyService.GetGems(player)
+                
+                Modules.RemoteIndex.FireClient("Currency_Update", player, {
+                    Gold = gold,
+                    Gems = gems,
+                })
             end
-            DataManager.SetValue(player, "Dungeon.UnlockedMonsters", data.Dungeon.UnlockedMonsters)
             
-            -- Alle Helden freischalten
-            for heroId, _ in pairs(HeroConfig.Heroes) do
-                data.Heroes.Unlocked[heroId] = true
+            if Modules.DungeonSystem then
+                local dungeonData = Modules.DungeonSystem.GetDungeonData(player)
+                
+                Modules.RemoteIndex.FireClient("Dungeon_Update", player, {
+                    Level = dungeonData.Level,
+                    Rooms = dungeonData.Rooms,
+                })
             end
-            DataManager.SetValue(player, "Heroes.Unlocked", data.Heroes.Unlocked)
-            
-            -- Client updaten
-            RemoteIndex.FireClient("Dungeon_Update", player, {
-                UnlockedTraps = data.Dungeon.UnlockedTraps,
-                UnlockedMonsters = data.Dungeon.UnlockedMonsters,
+        end)
+    end
+    
+    -- CurrencyService Signals
+    if Modules.CurrencyService and Modules.CurrencyService.Signals then
+        Modules.CurrencyService.Signals.CurrencyChanged:Connect(function(player, currencyType, newAmount, delta)
+            Modules.RemoteIndex.FireClient("Currency_Update", player, {
+                [currencyType] = newAmount,
             })
-            RemoteIndex.FireClient("Heroes_Update", player, {
-                Unlocked = data.Heroes.Unlocked,
+        end)
+    end
+    
+    -- DungeonSystem Signals
+    if Modules.DungeonSystem and Modules.DungeonSystem.Signals then
+        Modules.DungeonSystem.Signals.LevelUp:Connect(function(player, newLevel)
+            Modules.RemoteIndex.FireClient("Dungeon_Update", player, {
+                Level = newLevel,
+                LevelUp = true,
             })
-        end
-        return { Success = true, Message = "Alles freigeschaltet" }
+            
+            -- Level-Up Belohnung
+            if Modules.RewardSystem then
+                Modules.RewardSystem.GrantLevelUpReward(player, newLevel)
+            end
+        end)
+    end
+    
+    -- RaidSystem Signals
+    if Modules.RaidSystem and Modules.RaidSystem.Signals then
+        Modules.RaidSystem.Signals.RaidStarted:Connect(function(player, raidId)
+            log("Signal", "Raid gestartet: " .. raidId)
+        end)
         
-    elseif command == "SkipCooldown" then
-        DataManager.SetValue(player, "Cooldowns.LastRaidTime", 0)
-        return { Success = true, Message = "Raid-Cooldown zurückgesetzt" }
+        Modules.RaidSystem.Signals.RaidEnded:Connect(function(player, raidId, result)
+            log("Signal", "Raid beendet: " .. raidId .. " - " .. result.Status)
+            
+            -- Belohnungen geben
+            if Modules.RewardSystem then
+                Modules.RewardSystem.GrantRaidReward(player, result)
+            end
+        end)
+    end
+    
+    -- RewardSystem Signals
+    if Modules.RewardSystem and Modules.RewardSystem.Signals then
+        Modules.RewardSystem.Signals.AchievementUnlocked:Connect(function(player, achievementId, achievement)
+            log("Signal", player.Name .. " hat Achievement freigeschaltet: " .. achievement.Name)
+        end)
+    end
+    
+    logSuccess("Phase 8 abgeschlossen: Signals verbunden")
+end
+
+-------------------------------------------------
+-- HAUPTINITIALISIERUNG
+-------------------------------------------------
+local function main()
+    local startTime = os.clock()
+    
+    local success, error = pcall(function()
+        -- Phase 1: Shared Modules
+        loadSharedModules()
         
+        -- Phase 2: Core Modules
+        loadCoreModules()
+        
+        -- Phase 3: Services
+        loadServices()
+        
+        -- Phase 4: Systems
+        loadSystems()
+        
+        -- Phase 5: Initialisierung
+        initializeModules()
+        
+        -- Phase 6: Remote Events
+        setupRemoteEvents()
+        
+        -- Phase 7: Player Handling
+        setupPlayerHandling()
+        
+        -- Phase 8: Signal Verbindungen
+        setupSignalConnections()
+    end)
+    
+    local endTime = os.clock()
+    local duration = string.format("%.2f", endTime - startTime)
+    
+    if success then
+        print("═══════════════════════════════════════════")
+        print("  ✅ SERVER ERFOLGREICH GESTARTET")
+        print("  ⏱️  Dauer: " .. duration .. " Sekunden")
+        print("  📊 Module geladen: " .. tostring(#Players:GetPlayers()) .. " Spieler online")
+        print("═══════════════════════════════════════════")
     else
-        return { Success = false, Error = "Unbekannter Befehl: " .. tostring(command) }
+        print("═══════════════════════════════════════════")
+        print("  ❌ SERVER START FEHLGESCHLAGEN")
+        print("  Error: " .. tostring(error))
+        print("═══════════════════════════════════════════")
     end
 end
 
-print("[ServerMain] Remote Handler verbunden!")
+-- Server starten
+main()
 
 -------------------------------------------------
--- RAID-SYSTEM EVENTS VERBINDEN
+-- GLOBAL ACCESS (für Debugging)
 -------------------------------------------------
+if DEBUG_MODE then
+    _G.DungeonTycoon = {
+        Modules = Modules,
+        GetModule = function(name)
+            return Modules[name]
+        end,
+    }
+end
 
--- XP nach Raid verteilen
-RaidSystem.Signals.RaidEnded:Connect(function(player, result)
-    HeroSystem.DistributeRaidXP(player, result)
-end)
-
-print("[ServerMain] System-Events verbunden!")
-
--------------------------------------------------
--- GAMELOOP STARTEN
--------------------------------------------------
-print("[ServerMain] Starte GameLoop...")
-GameLoop.Start()
-print("[ServerMain] GameLoop gestartet!")
-
--------------------------------------------------
--- SERVER BEREIT
--------------------------------------------------
-print("[ServerMain] ========================================")
-print("[ServerMain] Dungeon Tycoon Server bereit!")
-print("[ServerMain] Version: 1.0.0")
-print("[ServerMain] Debug-Modus: " .. tostring(GameConfig.Debug.Enabled))
-print("[ServerMain] ========================================")
+return Modules
